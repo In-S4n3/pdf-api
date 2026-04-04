@@ -23,6 +23,7 @@ WORKDIR /app
 # Environment optimizations
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
+ENV PORT=8080
 
 # Install Python dependencies (cached layer)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -41,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8080
 
 # Run with uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
