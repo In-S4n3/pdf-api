@@ -4,14 +4,19 @@ Used to validate the multipart upload / binary response contract
 without any PDF processing. Critical for Phase 9-10 integration testing.
 """
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import Response
+
+from app.auth import verify_api_key
 
 router = APIRouter()
 
 
 @router.post("/echo")
-async def echo(file: UploadFile = File(...)) -> Response:
+async def echo(
+    file: UploadFile = File(...),
+    _key: str = Depends(verify_api_key),
+) -> Response:
     """Accept a file upload and return it unmodified."""
     content = await file.read()
     filename = file.filename or "output.pdf"
