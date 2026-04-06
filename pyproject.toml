@@ -9,6 +9,7 @@ dependencies = [
     "fastapi[standard]>=0.135.0",
     "pymupdf>=1.27.0",
     "pikepdf>=10.5.0",
+    "ocrmypdf>=16.0.0",
 ]
 
 [dependency-groups]
