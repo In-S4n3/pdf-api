@@ -12,12 +12,14 @@ from app.tools.compress import router as compress_router
 from app.tools.echo import router as echo_router
 from app.tools.flatten import router as flatten_router
 from app.tools.pdfa import router as pdfa_router
+from app.tools.redact import router as redact_router
 
 router = APIRouter()
 router.include_router(echo_router)
 router.include_router(compress_router)
 router.include_router(flatten_router)
 router.include_router(pdfa_router)
+router.include_router(redact_router)
 
 
 @router.get("/health")
