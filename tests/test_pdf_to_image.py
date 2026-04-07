@@ -100,7 +100,7 @@ def test_invalid_pdf_returns_400_portuguese(client):
     )
     assert response.status_code == 400
     body = response.json()
-    assert "possivel" in body["detail"].lower() or "valido" in body["detail"].lower()
+    assert "possivel" in body["error"].lower() or "valido" in body["error"].lower()
 
 
 def test_missing_file_returns_422(client):
