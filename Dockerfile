@@ -8,8 +8,14 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     tesseract-ocr \
-    tesseract-ocr-por \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-deu \
     tesseract-ocr-eng \
+    tesseract-ocr-fra \
+    tesseract-ocr-ita \
+    tesseract-ocr-jpn \
+    tesseract-ocr-por \
+    tesseract-ocr-spa \
     libreoffice-writer-nogui \
     libreoffice-calc-nogui \
     libreoffice-impress-nogui \
