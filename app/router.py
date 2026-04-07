@@ -9,6 +9,7 @@ import subprocess
 from fastapi import APIRouter
 
 from app.tools.compress import router as compress_router
+from app.tools.convert import router as convert_router
 from app.tools.echo import router as echo_router
 from app.tools.flatten import router as flatten_router
 from app.tools.fill_form import router as fill_form_router
@@ -21,6 +22,7 @@ from app.tools.redact import router as redact_router
 router = APIRouter()
 router.include_router(echo_router)
 router.include_router(compress_router)
+router.include_router(convert_router)
 router.include_router(flatten_router)
 router.include_router(ocr_router)
 router.include_router(pdfa_router)
