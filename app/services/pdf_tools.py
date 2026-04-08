@@ -242,6 +242,37 @@ def _convert_image_with_libreoffice(content: bytes, content_type: str) -> bytes:
         return output_path.read_bytes()
 
 
+def _sanitize_image(content: bytes) -> bytes:
+    """Re-encode an image to strip ICC profiles and problematic metadata.
+
+    Some ICC profiles (e.g. short lcms "c2" profiles) cause Adobe Acrobat to
+    render the resulting PDF as a solid black page.  Re-saving through Pillow
+    in sRGB without the original ICC profile eliminates the issue.
+    """
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(content))
+    if not img.info.get("icc_profile"):
+        return content  # nothing to strip
+
+    out = io.BytesIO()
+    save_kwargs: dict[str, object] = {}
+    if img.format == "JPEG" or img.mode in ("RGB", "L"):
+        save_kwargs["format"] = "JPEG"
+        save_kwargs["quality"] = 95
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
+    else:
+        save_kwargs["format"] = img.format or "PNG"
+        if img.mode == "RGBA":
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            img = background
+
+    img.save(out, **save_kwargs)
+    return out.getvalue()
+
+
 def convert_to_pdf(content: bytes, content_type: str | None, filename: str | None) -> bytes:
     """Convert a supported office document or image to PDF."""
     resolved_content_type = _resolve_convert_content_type(content_type, filename)
@@ -256,7 +287,7 @@ def convert_to_pdf(content: bytes, content_type: str | None, filename: str | Non
         return _convert_office(content, resolved_content_type)
 
     try:
-        return img2pdf.convert(content)
+        return img2pdf.convert(_sanitize_image(content))
     except Exception:
         return _convert_image_with_libreoffice(content, resolved_content_type)
 
