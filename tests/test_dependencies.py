@@ -8,8 +8,8 @@ container where system dependencies are installed.
 import subprocess
 from pathlib import Path
 
-import pymupdf
 import pikepdf
+import pymupdf
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

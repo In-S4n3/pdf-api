@@ -4,6 +4,8 @@ FROM python:3.12-slim-bookworm
 # Install uv from official image
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+ARG INSTALL_DEV=false
+
 # Install system dependencies (PDF processing tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
@@ -19,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer-nogui \
     libreoffice-calc-nogui \
     libreoffice-impress-nogui \
+    unpaper \
     fonts-liberation \
     fonts-dejavu \
     && rm -rf /var/lib/apt/lists/*
@@ -35,13 +38,21 @@ ENV PORT=8080
 COPY pyproject.toml uv.lock ./
 
 # Install Python dependencies
-RUN uv sync --frozen --no-install-project --no-dev
+RUN if [ "$INSTALL_DEV" = "true" ]; then \
+        uv sync --frozen --no-install-project; \
+    else \
+        uv sync --frozen --no-install-project --no-dev; \
+    fi
 
 # Copy application code
 COPY . /app
 
 # Final sync (installs the project itself)
-RUN uv sync --frozen --no-dev
+RUN if [ "$INSTALL_DEV" = "true" ]; then \
+        uv sync --frozen; \
+    else \
+        uv sync --frozen --no-dev; \
+    fi
 
 # Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"

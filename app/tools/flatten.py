@@ -5,37 +5,26 @@ stamps, ink, etc.) and form widgets (text fields, checkboxes, radio
 buttons, dropdowns) into static page content.
 """
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import Response
 
 from app.auth import verify_api_key
+from app.http_utils import file_response, read_upload_bytes, run_legacy_service
+from app.services.pdf_tools import flatten_pdf
 
 router = APIRouter()
+ApiKeyDep = Annotated[str, Depends(verify_api_key)]
+UploadedFile = Annotated[UploadFile, File(...)]
 
 
 @router.post("/flatten")
 async def flatten(
-    file: UploadFile = File(...),
-    _key: str = Depends(verify_api_key),
+    file: UploadedFile,
+    _key: ApiKeyDep,
 ) -> Response:
     """Accept a PDF and return it with annotations/forms baked in."""
-    import pymupdf
-
-    content = await file.read()
-    doc = pymupdf.open(stream=content, filetype="pdf")
-
-    # Bake ALL annotations and form fields into permanent page content.
-    # annots=True: highlights, comments, stamps, ink drawings, etc.
-    # widgets=True: text fields, checkboxes, radio buttons, dropdowns.
-    doc.bake(annots=True, widgets=True)
-
-    # Save with cleanup (remove orphaned objects from baked annotations)
-    result = doc.tobytes(garbage=4, deflate=True)
-    doc.close()
-
-    filename = file.filename or "output.pdf"
-    return Response(
-        content=result,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    content = await read_upload_bytes(file, legacy=True)
+    result = await run_legacy_service(flatten_pdf, content)
+    return file_response(result, "application/pdf", file.filename, "output.pdf")

@@ -4,96 +4,35 @@ Uses OCRmyPDF CLI (subprocess) with --skip-text to OCR pages
 that lack a text layer. Supports 8 languages via Tesseract.
 """
 
-import json
-import subprocess
-import tempfile
-from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import Response
 
 from app.auth import verify_api_key
+from app.http_utils import (
+    file_response,
+    parse_legacy_options,
+    read_upload_bytes,
+    run_legacy_service,
+)
+from app.services.pdf_tools import ocr_pdf
 
 router = APIRouter()
-
-LANGUAGE_MAP = {
-    "english": "eng",
-    "spanish": "spa",
-    "french": "fra",
-    "german": "deu",
-    "portuguese": "por",
-    "italian": "ita",
-    "chinese": "chi_sim",
-    "jpn": "jpn",
-}
+ApiKeyDep = Annotated[str, Depends(verify_api_key)]
+UploadedFile = Annotated[UploadFile, File(...)]
+LegacyOptions = Annotated[str, Form()]
 
 
 @router.post("/ocr")
 async def ocr(
-    file: UploadFile = File(...),
-    options: str = Form("{}"),
-    _key: str = Depends(verify_api_key),
+    file: UploadedFile,
+    _key: ApiKeyDep,
+    options: LegacyOptions = "{}",
 ) -> Response:
     """Accept a PDF and return it with an OCR text layer."""
-    opts = json.loads(options)
+    opts = parse_legacy_options(options)
     language = opts.get("language", "english")
-    lang_code = LANGUAGE_MAP.get(language)
-
-    if lang_code is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language: {language}. "
-            f"Supported: {', '.join(LANGUAGE_MAP.keys())}",
-        )
-
-    content = await file.read()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = Path(tmpdir) / "input.pdf"
-        output_path = Path(tmpdir) / "output.pdf"
-        input_path.write_bytes(content)
-
-        result = subprocess.run(
-            [
-                "ocrmypdf",
-                "--skip-text",
-                "--output-type", "pdf",
-                "-l", lang_code,
-                "--deskew",
-                "--clean",
-                "--optimize", "1",
-                "--tesseract-timeout", "60",
-                str(input_path),
-                str(output_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-        if result.returncode == 2:
-            raise HTTPException(
-                status_code=400,
-                detail="Ficheiro PDF invalido ou corrompido",
-            )
-
-        if result.returncode == 8:
-            raise HTTPException(
-                status_code=400,
-                detail="PDF protegido por palavra-passe. Remova a protecao primeiro.",
-            )
-
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail="Falha no processamento OCR",
-            )
-
-        pdf_bytes = output_path.read_bytes()
-
-    filename = file.filename or "output.pdf"
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    content = await read_upload_bytes(file, legacy=True)
+    pdf_bytes = await run_legacy_service(ocr_pdf, content, language)
+    return file_response(pdf_bytes, "application/pdf", file.filename, "output.pdf")

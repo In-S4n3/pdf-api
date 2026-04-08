@@ -19,3 +19,19 @@ def test_health_includes_versions(client):
     assert "ghostscript" in versions
     assert "tesseract" in versions
     assert "libreoffice" in versions
+
+
+def test_health_handles_missing_binaries(client, monkeypatch):
+    """Missing binaries should degrade to 'unavailable' instead of returning 500."""
+    import subprocess
+
+    def raise_missing_binary(*args, **kwargs):
+        raise FileNotFoundError("missing")
+
+    monkeypatch.setattr(subprocess, "run", raise_missing_binary)
+    response = client.get("/health")
+    assert response.status_code == 200
+    versions = response.json()["versions"]
+    assert versions["ghostscript"] == "unavailable"
+    assert versions["tesseract"] == "unavailable"
+    assert versions["libreoffice"] == "unavailable"
