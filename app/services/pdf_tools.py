@@ -128,7 +128,7 @@ def _compile_pattern(
     if strategy == "custom":
         if not custom_text.strip():
             raise ApiError(400, "missing_custom_text", "Texto personalizado é obrigatório.")
-        return _re.escape(custom_text), _re.IGNORECASE
+        return _re.escape(custom_text), regex.IGNORECASE
 
     if strategy == "regex":
         if not regex_pattern.strip():
