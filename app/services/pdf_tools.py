@@ -789,6 +789,31 @@ def redact_pdf(
                 finally:
                     pymupdf.TOOLS.set_small_glyph_heights(False)
 
+        # CRITICAL: strip residual sensitive data from outline/metadata/hidden text.
+        # Without this, the "redacted" PDF can still leak the redacted content via
+        # bookmark titles (EU AstraZeneca 2021), metadata (multiple), or OCR
+        # invisible layers (Epstein documents 2024). See spec for full citations.
+        # Runs UNCONDITIONALLY — even a no-match round-trip must strip metadata.
+        doc.scrub(
+            attached_files=True,
+            embedded_files=True,
+            hidden_text=True,
+            javascript=True,
+            metadata=True,
+            xml_metadata=True,
+            remove_links=True,
+            reset_fields=True,
+            reset_responses=True,
+            thumbnails=True,
+            clean_pages=True,
+            redactions=False,   # already applied above with explicit options
+            redact_images=0,
+        )
+        # scrub() does NOT touch the document outline (verified against pymupdf
+        # 1.27 docs). Clear the TOC explicitly so bookmark titles cannot leak
+        # — this is the exact EU AstraZeneca 2021 failure mode.
+        doc.set_toc([])
+
         return doc.tobytes(garbage=4, deflate=True, clean=True)
     except ApiError:
         raise
