@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
-import re
+import re as _re
 import subprocess
 import tempfile
 import threading
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import img2pdf
+import regex
 
 from app.api_errors import ApiError
 
@@ -68,8 +69,11 @@ CONFORMANCE_MAP = {
     "pdfa-3b": "3",
 }
 
-EMAIL_PATTERN = r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
-PHONE_PATTERN = r"[\+]?[(]?[0-9]{1,4}[)]?[-\s\./0-9]{7,15}"
+REGEX_TIMEOUT_SECONDS = 0.5
+
+# Updated patterns — \b anchors prevent partial matches like "fxxx@yyy" capture
+EMAIL_PATTERN = r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b"
+PHONE_PATTERN = r"\b\+?\(?\d{1,4}\)?[\d\s./\-]{6,14}\d\b"
 PATTERNS = {
     "email": EMAIL_PATTERN,
     "phone": PHONE_PATTERN,
@@ -112,6 +116,74 @@ def _make_match(
         id=digest, page=page_idx, bbox=bbox, kind=strategy,
         context=context, full_match=full_match,
     )
+
+
+def _compile_pattern(
+    strategy: str, custom_text: str, regex_pattern: str
+) -> tuple[str, int]:
+    """Validate inputs and return (pattern, flags). Raises ApiError on bad input."""
+    if strategy not in VALID_REDACTION_STRATEGIES:
+        raise ApiError(400, "invalid_redaction_strategy", "Estratégia de redacção inválida.")
+
+    if strategy == "custom":
+        if not custom_text.strip():
+            raise ApiError(400, "missing_custom_text", "Texto personalizado é obrigatório.")
+        return _re.escape(custom_text), _re.IGNORECASE
+
+    if strategy == "regex":
+        if not regex_pattern.strip():
+            raise ApiError(400, "missing_regex_pattern", "Padrão regex é obrigatório.")
+        if len(regex_pattern) > MAX_REGEX_LENGTH:
+            raise ApiError(
+                400, "regex_too_long",
+                f"Padrão regex demasiado longo (máx {MAX_REGEX_LENGTH} caracteres).",
+            )
+        try:
+            regex.compile(regex_pattern)
+        except regex.error as exc:
+            raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
+        return regex_pattern, 0
+
+    return PATTERNS[strategy], 0
+
+
+def _extract_matches(
+    doc, *, strategy: str, custom_text: str, regex_pattern: str
+) -> list[RedactionMatch]:
+    """Find all matches across all pages. Used by both /preview and /redact."""
+    pattern_str, flags = _compile_pattern(strategy, custom_text, regex_pattern)
+    matches: list[RedactionMatch] = []
+
+    for page_idx, page in enumerate(doc):
+        text = page.get_text("text")
+        try:
+            iter_matches = list(
+                regex.finditer(pattern_str, text, flags=flags, timeout=REGEX_TIMEOUT_SECONDS)
+            )
+        except regex.error as exc:
+            raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
+        except TimeoutError as exc:
+            raise ApiError(
+                400, "regex_too_slow",
+                "O padrão regex é demasiado complexo (possível ReDoS). Simplifique-o.",
+            ) from exc
+
+        full_match_strings = {m.group() for m in iter_matches}
+
+        for match_str in full_match_strings:
+            for rect in page.search_for(match_str):
+                # Decompose the match rect into per-word bboxes for clean preview highlights.
+                words = page.get_text("words", clip=rect)
+                if not words:
+                    bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
+                    matches.append(_make_match(strategy, page_idx, bbox, match_str, match_str))
+                    continue
+                for w in words:
+                    bbox = (w[0], w[1], w[2], w[3])
+                    word_text = w[4]
+                    matches.append(_make_match(strategy, page_idx, bbox, word_text, match_str))
+
+    return matches
 
 
 def _trim_process_output(value: str, limit: int = 500) -> str:
@@ -700,8 +772,8 @@ def redact_pdf(
                 message=f"Regex pattern too long (max {MAX_REGEX_LENGTH} chars).",
             )
         try:
-            re.compile(regex_pattern)
-        except re.error as exc:
+            _re.compile(regex_pattern)
+        except _re.error as exc:
             raise ApiError(
                 status_code=400,
                 code="invalid_regex_pattern",
@@ -712,8 +784,8 @@ def redact_pdf(
         pattern = PATTERNS[strategy]
         flags = 0
     elif strategy == "custom":
-        pattern = re.escape(custom_text)
-        flags = re.IGNORECASE
+        pattern = _re.escape(custom_text)
+        flags = _re.IGNORECASE
     else:
         pattern = regex_pattern
         flags = 0
@@ -734,7 +806,7 @@ def redact_pdf(
             try:
                 for page in doc:
                     text = page.get_text("text")
-                    matches = {match.group() for match in re.finditer(pattern, text, flags)}
+                    matches = {match.group() for match in _re.finditer(pattern, text, flags)}
                     page_has_redactions = False
                     for match_text in matches:
                         rects = page.search_for(match_text)
