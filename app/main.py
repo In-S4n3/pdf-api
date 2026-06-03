@@ -50,23 +50,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+_settings = get_settings()
+
 app = FastAPI(
     title="TudoPDF API",
     description="PDF processing API for TudoPDF",
     version="0.1.0",
     lifespan=lifespan,
-    docs_url="/docs",
+    docs_url="/docs" if DEBUG else None,
     redoc_url="/redoc" if DEBUG else None,
+    openapi_url="/openapi.json" if DEBUG else None,
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if DEBUG else [],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
-app.include_router(router)
 
 
 @app.middleware("http")
@@ -76,6 +70,16 @@ async def request_id_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
     return response
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if DEBUG else list(_settings.cors_allowed_origins),
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
 
 
 @app.exception_handler(ApiError)

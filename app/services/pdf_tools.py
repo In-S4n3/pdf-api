@@ -209,6 +209,8 @@ def _run_command(
             command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
     except FileNotFoundError as exc:
@@ -846,6 +848,8 @@ def build_health_payload() -> dict[str, Any]:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
