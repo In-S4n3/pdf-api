@@ -75,23 +75,39 @@ def parse_legacy_options(raw_options: str) -> dict[str, Any]:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
 
+_READ_CHUNK_SIZE = 64 * 1024  # 64 KB
+
+
 async def read_upload_bytes(file: UploadFile, *, legacy: bool = False) -> bytes:
-    """Read upload bytes and enforce the configured size limit when enabled."""
-    content = await file.read()
+    """Read upload bytes in chunks, aborting as soon as the size limit is exceeded.
+
+    Reading the entire payload before checking length lets an attacker OOM the
+    container with a single oversized request. Streaming and bailing early caps
+    peak memory at `max_upload_bytes + chunk_size`.
+    """
     settings = get_settings()
-    if settings.max_upload_bytes is not None and len(content) > settings.max_upload_bytes:
-        error = ApiError(
-            status_code=413,
-            code="file_too_large",
-            message=(
-                f"Uploaded file exceeds the configured limit of "
-                f"{settings.max_upload_bytes} bytes."
-            ),
-        )
-        if legacy:
-            raise HTTPException(status_code=error.status_code, detail=error.message) from error
-        raise error
-    return content
+    max_bytes = settings.max_upload_bytes
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            error = ApiError(
+                status_code=413,
+                code="file_too_large",
+                message=(
+                    f"Uploaded file exceeds the configured limit of "
+                    f"{max_bytes} bytes."
+                ),
+            )
+            if legacy:
+                raise HTTPException(status_code=error.status_code, detail=error.message) from error
+            raise error
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def run_service[T](service: Callable[..., T], *args: Any, **kwargs: Any) -> T:
