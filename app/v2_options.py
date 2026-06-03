@@ -73,10 +73,30 @@ class FillFormOptions(StrictOptionsModel):
     fields: dict[str, JsonScalar] = Field(min_length=1)
 
 
+class RedactPreviewOptions(StrictOptionsModel):
+    """Inputs for the dry-run preview — identical to RedactOptions minus
+    the confirmed_ids field. Kept separate so the Pydantic error message
+    tells users 'preview accepts strategy/customText/regexPattern' rather
+    than mentioning confirmed_ids that don't apply at this stage."""
+
+    strategy: RedactionStrategy = RedactionStrategy.email
+    customText: str = ""
+    regexPattern: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_strategy_inputs(self) -> RedactPreviewOptions:
+        if self.strategy == RedactionStrategy.custom and not self.customText.strip():
+            raise ValueError("customText is required when strategy='custom'.")
+        if self.strategy == RedactionStrategy.regex and not self.regexPattern.strip():
+            raise ValueError("regexPattern is required when strategy='regex'.")
+        return self
+
+
 class RedactOptions(StrictOptionsModel):
     strategy: RedactionStrategy = RedactionStrategy.email
     customText: str = ""
     regexPattern: str = Field(default="", max_length=500)
+    confirmed_ids: list[str] | None = None  # NEW — preview-confirmed match subset
 
     @model_validator(mode="after")
     def validate_strategy_inputs(self) -> RedactOptions:
