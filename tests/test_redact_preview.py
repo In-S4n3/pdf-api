@@ -75,3 +75,29 @@ def test_preview_encrypted_pdf_400():
     )
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "password_protected_pdf"
+
+
+def test_apply_with_confirmed_ids_round_trips():
+    """Preview returns IDs; apply with subset of those IDs redacts only the subset."""
+    preview = _post_preview(strategy="email")
+    matches = preview.json()["matches"]
+    alice_ids = [m["id"] for m in matches if "alice" in m["fullMatch"]]
+    assert alice_ids
+
+    import json
+
+    files = {"file": ("sample.pdf", io.BytesIO(FIXTURE.read_bytes()), "application/pdf")}
+    r = client.post(
+        "/v2/redact",
+        files=files,
+        data={"options": json.dumps({"strategy": "email", "confirmed_ids": alice_ids})},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert r.status_code == 200, r.text
+
+    import pymupdf
+
+    with pymupdf.open(stream=r.content, filetype="pdf") as doc:
+        text = "\n".join(p.get_text("text") for p in doc)
+    assert "alice" not in text.lower(), text
+    assert "bob@example.org" in text  # bob NOT redacted (not in confirmed_ids)
