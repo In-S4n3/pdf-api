@@ -96,7 +96,10 @@ class RedactOptions(StrictOptionsModel):
     strategy: RedactionStrategy = RedactionStrategy.email
     customText: str = ""
     regexPattern: str = Field(default="", max_length=500)
-    confirmed_ids: list[str] | None = None  # NEW — preview-confirmed match subset
+    # 10000 ceiling matches 2x the preview cap (5000) so the field never
+    # rejects a list of legitimate preview-confirmed IDs even with worst-case
+    # frontend selection inversion. Prevents pathological payloads.
+    confirmed_ids: list[str] | None = Field(default=None, max_length=10000)
 
     @model_validator(mode="after")
     def validate_strategy_inputs(self) -> RedactOptions:
@@ -117,11 +120,14 @@ def options_dependency[OptionsModel: StrictOptionsModel](
         try:
             return model_type.model_validate(raw_options)
         except ValidationError as exc:
+            # include_context=False strips ctx.error (which can hold a non-JSON-
+            # serializable ValueError instance from @model_validator branches),
+            # otherwise FastAPI's response serializer crashes with TypeError.
             raise ApiError(
                 status_code=422,
                 code="invalid_options",
                 message="Options validation failed.",
-                details=exc.errors(),
+                details=exc.errors(include_context=False),
             ) from exc
 
     return Depends(dependency)

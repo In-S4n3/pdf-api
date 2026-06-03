@@ -101,3 +101,45 @@ def test_apply_with_confirmed_ids_round_trips():
         text = "\n".join(p.get_text("text") for p in doc)
     assert "alice" not in text.lower(), text
     assert "bob@example.org" in text  # bob NOT redacted (not in confirmed_ids)
+
+
+def test_preview_missing_custom_text_returns_422_not_500():
+    """Regression: model_validator's ValueError used to leak into FastAPI's
+    response serializer and produce a 500. Verify it now returns a clean 422."""
+    files = {"file": ("sample.pdf", io.BytesIO(FIXTURE.read_bytes()), "application/pdf")}
+    r = client.post(
+        "/v2/redact/preview",
+        files=files,
+        data={"options": '{"strategy":"custom","customText":""}'},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["error"]["code"] == "invalid_options"
+    # details must serialize cleanly — no ValueError object in payload
+    assert isinstance(body["error"]["details"], list)
+
+
+def test_preview_missing_regex_pattern_returns_422_not_500():
+    files = {"file": ("sample.pdf", io.BytesIO(FIXTURE.read_bytes()), "application/pdf")}
+    r = client.post(
+        "/v2/redact/preview",
+        files=files,
+        data={"options": '{"strategy":"regex","regexPattern":""}'},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "invalid_options"
+
+
+def test_apply_missing_custom_text_returns_422_not_500():
+    """Same regression on the apply path."""
+    files = {"file": ("sample.pdf", io.BytesIO(FIXTURE.read_bytes()), "application/pdf")}
+    r = client.post(
+        "/v2/redact",
+        files=files,
+        data={"options": '{"strategy":"custom","customText":""}'},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "invalid_options"
