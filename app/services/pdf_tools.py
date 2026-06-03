@@ -244,6 +244,12 @@ def compress_pdf(content: bytes) -> bytes:
     doc = None
     try:
         doc = pymupdf.open(stream=content, filetype="pdf")
+        if doc.needs_pass:
+            raise ApiError(
+                status_code=400,
+                code="password_protected_pdf",
+                message="Este PDF está protegido por palavra-passe. Remova a proteção antes de comprimir.",
+            )
         doc.rewrite_images(
             dpi_threshold=150,
             dpi_target=96,
@@ -255,6 +261,8 @@ def compress_pdf(content: bytes) -> bytes:
             clean=True,
             use_objstms=True,
         )
+    except ApiError:
+        raise
     except Exception as exc:
         raise ApiError(
             status_code=400,
@@ -273,8 +281,16 @@ def flatten_pdf(content: bytes) -> bytes:
     doc = None
     try:
         doc = pymupdf.open(stream=content, filetype="pdf")
+        if doc.needs_pass:
+            raise ApiError(
+                status_code=400,
+                code="password_protected_pdf",
+                message="Este PDF está protegido por palavra-passe. Remova a proteção antes de achatar.",
+            )
         doc.bake(annots=True, widgets=True)
         return doc.tobytes(garbage=4, deflate=True)
+    except ApiError:
+        raise
     except Exception as exc:
         raise ApiError(
             status_code=400,

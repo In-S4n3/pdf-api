@@ -1,8 +1,11 @@
 """Tests for POST /flatten endpoint."""
 
 import io
+from pathlib import Path
 
 import pymupdf
+
+ENCRYPTED_PDF = Path(__file__).parent / "fixtures" / "encrypted.pdf"
 
 
 def _make_pdf_with_form_fields() -> bytes:
@@ -97,3 +100,27 @@ def test_flatten_rejects_missing_file(client):
     """Flatten endpoint returns 422 when no file is provided."""
     response = client.post("/flatten")
     assert response.status_code == 422
+
+
+def test_flatten_rejects_encrypted_pdf(client):
+    """Encrypted PDFs return 400 with a Portuguese message (v1 envelope)."""
+    response = client.post(
+        "/flatten",
+        files={"file": ("encrypted.pdf", io.BytesIO(ENCRYPTED_PDF.read_bytes()), "application/pdf")},
+    )
+    assert response.status_code == 400
+    assert "palavra-passe" in response.json()["error"]
+
+
+def test_v2_flatten_rejects_encrypted_pdf(client):
+    """Encrypted PDFs return 400 + password_protected_pdf code (v2 envelope)."""
+    response = client.post(
+        "/v2/flatten",
+        files={"file": ("encrypted.pdf", io.BytesIO(ENCRYPTED_PDF.read_bytes()), "application/pdf")},
+        data={"options": "{}"},
+        headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "password_protected_pdf"
+    assert "palavra-passe" in body["error"]["message"]
