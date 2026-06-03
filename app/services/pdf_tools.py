@@ -745,100 +745,58 @@ def redact_pdf(
     strategy: str,
     custom_text: str = "",
     regex_pattern: str = "",
+    confirmed_ids: list[str] | None = None,
 ) -> bytes:
-    """Apply text redaction to a PDF."""
+    """Apply PII redaction. If confirmed_ids is None, redact every match.
+    If it is a list, redact only matches whose id is in the list (unknown ids
+    are silently skipped — the user's preview saw a set; we trust intent)."""
     import pymupdf
 
-    if strategy not in VALID_REDACTION_STRATEGIES:
-        raise ApiError(
-            status_code=400,
-            code="invalid_redaction_strategy",
-            message="Invalid redaction strategy.",
-        )
-
-    if strategy == "custom" and not custom_text.strip():
-        raise ApiError(
-            status_code=400,
-            code="missing_custom_text",
-            message="Custom text is required.",
-        )
-
-    if strategy == "regex":
-        if not regex_pattern.strip():
-            raise ApiError(
-                status_code=400,
-                code="missing_regex_pattern",
-                message="Regex pattern is required.",
-            )
-        if len(regex_pattern) > MAX_REGEX_LENGTH:
-            raise ApiError(
-                status_code=400,
-                code="regex_too_long",
-                message=f"Regex pattern too long (max {MAX_REGEX_LENGTH} chars).",
-            )
-        try:
-            _re.compile(regex_pattern)
-        except _re.error as exc:
-            raise ApiError(
-                status_code=400,
-                code="invalid_regex_pattern",
-                message="Invalid regex pattern.",
-            ) from exc
-
-    if strategy in PATTERNS:
-        pattern = PATTERNS[strategy]
-        flags = 0
-    elif strategy == "custom":
-        pattern = _re.escape(custom_text)
-        flags = _re.IGNORECASE
-    else:
-        pattern = regex_pattern
-        flags = 0
-
-    doc = None
     try:
         doc = pymupdf.open(stream=content, filetype="pdf")
     except Exception as exc:
-        raise ApiError(
-            status_code=400,
-            code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
-        ) from exc
+        raise ApiError(400, "invalid_pdf",
+            "Não foi possível abrir o PDF. Verifique se o ficheiro é válido.") from exc
 
     try:
-        with REDACTION_LOCK:
-            pymupdf.TOOLS.set_small_glyph_heights(True)
-            try:
-                for page in doc:
-                    text = page.get_text("text")
-                    matches = {match.group() for match in _re.finditer(pattern, text, flags)}
-                    page_has_redactions = False
-                    for match_text in matches:
-                        rects = page.search_for(match_text)
-                        for rect in rects:
-                            page.add_redact_annot(rect, fill=(0, 0, 0))
-                            page_has_redactions = True
+        # _extract_matches raises 400 password_protected_pdf when applicable
+        all_matches = _extract_matches(
+            doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern,
+        )
 
-                    if page_has_redactions:
-                        page.apply_redactions(
+        if confirmed_ids is not None:
+            confirmed_set = set(confirmed_ids)
+            matches_to_apply = [m for m in all_matches if m.id in confirmed_set]
+        else:
+            matches_to_apply = all_matches
+
+        if matches_to_apply:
+            with REDACTION_LOCK:
+                pymupdf.TOOLS.set_small_glyph_heights(True)
+                try:
+                    pages_with_redactions: set[int] = set()
+                    for m in matches_to_apply:
+                        page = doc[m.page]
+                        page.add_redact_annot(pymupdf.Rect(*m.bbox), fill=(0, 0, 0))
+                        pages_with_redactions.add(m.page)
+
+                    for page_idx in pages_with_redactions:
+                        doc[page_idx].apply_redactions(
                             images=pymupdf.PDF_REDACT_IMAGE_NONE,
                             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                            text=pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
                         )
-            finally:
-                pymupdf.TOOLS.set_small_glyph_heights(False)
+                finally:
+                    pymupdf.TOOLS.set_small_glyph_heights(False)
 
-        return doc.tobytes(garbage=4, deflate=True)
+        return doc.tobytes(garbage=4, deflate=True, clean=True)
     except ApiError:
         raise
     except Exception as exc:
-        raise ApiError(
-            status_code=500,
-            code="redaction_failed",
-            message="Nao foi possivel processar a redacao deste PDF.",
-        ) from exc
+        raise ApiError(500, "redaction_failed",
+            "Não foi possível processar a redacção deste PDF.") from exc
     finally:
-        if doc is not None:
-            doc.close()
+        doc.close()
 
 
 def build_health_payload() -> dict[str, Any]:

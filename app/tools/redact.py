@@ -43,5 +43,6 @@ async def redact(
         strategy=strategy,
         custom_text=custom_text,
         regex_pattern=regex_pattern,
+        confirmed_ids=None,
     )
     return file_response(result, "application/pdf", file.filename, "output.pdf")

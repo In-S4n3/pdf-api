@@ -180,5 +180,6 @@ async def redact_v2(
         strategy=options.strategy.value,
         custom_text=options.customText,
         regex_pattern=options.regexPattern,
+        confirmed_ids=None,
     )
     return file_response(result, "application/pdf", file.filename, "output.pdf")
