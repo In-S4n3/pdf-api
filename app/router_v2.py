@@ -6,9 +6,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, UploadFile
 
+from app.api_errors import ApiError
 from app.auth import verify_api_key
 from app.http_utils import file_response, filename_stem, read_upload_bytes, run_service
 from app.services.pdf_tools import (
+    _extract_matches,
     build_health_payload,
     compress_pdf,
     convert_pdf_to_pdfa,
@@ -28,6 +30,7 @@ from app.v2_options import (
     PdfToImageOptions,
     ProtectOptions,
     RedactOptions,
+    RedactPreviewOptions,
     options_dependency,
 )
 
@@ -41,6 +44,14 @@ PdfaOptionsDep = Annotated[PdfaOptions, options_dependency(PdfaOptions)]
 PdfToImageOptionsDep = Annotated[PdfToImageOptions, options_dependency(PdfToImageOptions)]
 ProtectOptionsDep = Annotated[ProtectOptions, options_dependency(ProtectOptions)]
 RedactOptionsDep = Annotated[RedactOptions, options_dependency(RedactOptions)]
+RedactPreviewOptionsDep = Annotated[
+    RedactPreviewOptions, options_dependency(RedactPreviewOptions)
+]
+
+# Caps payload size on pathological inputs (e.g. a regex that matches every
+# word on every page). Frontend uses `truncated` to surface a "refine pattern"
+# nudge instead of silently dropping matches.
+_PREVIEW_MATCH_CAP = 5000
 
 
 @router.get("/health")
@@ -183,3 +194,71 @@ async def redact_v2(
         confirmed_ids=None,
     )
     return file_response(result, "application/pdf", file.filename, "output.pdf")
+
+
+def _extract_matches_json(
+    content: bytes, *, strategy: str, custom_text: str, regex_pattern: str
+) -> list[dict[str, object]]:
+    """Open the PDF, extract matches via the shared helper, serialise to JSON-ready dicts.
+
+    Lives in the route module (not pdf_tools) because it is purely a transport
+    concern — the service helper deliberately returns the dataclass, not JSON.
+    """
+    import pymupdf
+
+    try:
+        doc = pymupdf.open(stream=content, filetype="pdf")
+    except Exception as exc:
+        raise ApiError(
+            400,
+            "invalid_pdf",
+            "Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
+        ) from exc
+
+    try:
+        # _extract_matches raises 400 password_protected_pdf / invalid_regex_pattern
+        # / regex_too_slow as ApiError — middleware turns those into the v2 envelope.
+        matches = _extract_matches(
+            doc,
+            strategy=strategy,
+            custom_text=custom_text,
+            regex_pattern=regex_pattern,
+        )
+        return [
+            {
+                "id": m.id,
+                "page": m.page,
+                "bbox": list(m.bbox),
+                "kind": m.kind,
+                "context": m.context,
+                "fullMatch": m.full_match,
+            }
+            for m in matches
+        ]
+    finally:
+        doc.close()
+
+
+@router.post("/redact/preview")
+async def redact_preview_v2(
+    file: UploadedFile,
+    options: RedactPreviewOptionsDep,
+    _key: ApiKeyDep,
+):
+    """Dry-run: return matches as JSON so the UI can render bbox overlays
+    before the user confirms which IDs to apply via POST /v2/redact."""
+    content = await read_upload_bytes(file)
+    matches_json = await run_service(
+        _extract_matches_json,
+        content,
+        strategy=options.strategy.value,
+        custom_text=options.customText,
+        regex_pattern=options.regexPattern,
+    )
+
+    truncated = len(matches_json) > _PREVIEW_MATCH_CAP
+    return {
+        "matches": matches_json[:_PREVIEW_MATCH_CAP],
+        "total": len(matches_json),
+        "truncated": truncated,
+    }
