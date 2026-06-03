@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import subprocess
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +79,39 @@ VALID_REDACTION_STRATEGIES = ("email", "phone", "custom", "regex")
 MAX_REGEX_LENGTH = 500
 
 REDACTION_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class RedactionMatch:
+    id: str
+    page: int            # 0-indexed
+    bbox: tuple[float, float, float, float]  # (x0, y0, x1, y1) in PDF points
+    kind: str            # 'email' | 'phone' | 'custom' | 'regex'
+    context: str         # word text inside the bbox (visible in UI)
+    full_match: str      # the entire regex match (may span multiple words)
+
+
+def _make_match(
+    strategy: str,
+    page_idx: int,
+    bbox: tuple[float, float, float, float],
+    context: str,
+    full_match: str,
+) -> RedactionMatch:
+    """Build a RedactionMatch with a deterministic 16-char hex ID.
+
+    Same (strategy, page, bbox, context) -> same ID, so a confirmed-IDs
+    round-trip from frontend to backend continues to identify the same
+    matches even though the helper is called twice (once for preview,
+    once for apply).
+    """
+    digest = hashlib.sha1(
+        f"{strategy}|{page_idx}|{bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f},{bbox[3]:.2f}|{context}".encode()
+    ).hexdigest()[:16]
+    return RedactionMatch(
+        id=digest, page=page_idx, bbox=bbox, kind=strategy,
+        context=context, full_match=full_match,
+    )
 
 
 def _trim_process_output(value: str, limit: int = 500) -> str:
