@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
-import re
+import re as _re
 import subprocess
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import img2pdf
+import regex
 
 from app.api_errors import ApiError
 
@@ -66,8 +69,11 @@ CONFORMANCE_MAP = {
     "pdfa-3b": "3",
 }
 
-EMAIL_PATTERN = r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
-PHONE_PATTERN = r"[\+]?[(]?[0-9]{1,4}[)]?[-\s\./0-9]{7,15}"
+REGEX_TIMEOUT_SECONDS = 0.5
+
+# Updated patterns — \b anchors prevent partial matches like "fxxx@yyy" capture
+EMAIL_PATTERN = r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b"
+PHONE_PATTERN = r"\b\+?\(?\d{1,4}\)?[\d\s./\-]{6,14}\d\b"
 PATTERNS = {
     "email": EMAIL_PATTERN,
     "phone": PHONE_PATTERN,
@@ -77,6 +83,112 @@ VALID_REDACTION_STRATEGIES = ("email", "phone", "custom", "regex")
 MAX_REGEX_LENGTH = 500
 
 REDACTION_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class RedactionMatch:
+    id: str
+    page: int            # 0-indexed
+    bbox: tuple[float, float, float, float]  # (x0, y0, x1, y1) in PDF points
+    kind: str            # 'email' | 'phone' | 'custom' | 'regex'
+    context: str         # word text inside the bbox (visible in UI)
+    full_match: str      # the entire regex match (may span multiple words)
+
+
+def _make_match(
+    strategy: str,
+    page_idx: int,
+    bbox: tuple[float, float, float, float],
+    context: str,
+    full_match: str,
+) -> RedactionMatch:
+    """Build a RedactionMatch with a deterministic 16-char hex ID.
+
+    Same (strategy, page, bbox, context) -> same ID, so a confirmed-IDs
+    round-trip from frontend to backend continues to identify the same
+    matches even though the helper is called twice (once for preview,
+    once for apply).
+    """
+    digest = hashlib.sha1(
+        f"{strategy}|{page_idx}|{bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f},{bbox[3]:.2f}|{context}".encode()
+    ).hexdigest()[:16]
+    return RedactionMatch(
+        id=digest, page=page_idx, bbox=bbox, kind=strategy,
+        context=context, full_match=full_match,
+    )
+
+
+def _compile_pattern(
+    strategy: str, custom_text: str, regex_pattern: str
+) -> tuple[str, int]:
+    """Validate inputs and return (pattern, flags). Raises ApiError on bad input."""
+    if strategy not in VALID_REDACTION_STRATEGIES:
+        raise ApiError(400, "invalid_redaction_strategy", "Estratégia de redacção inválida.")
+
+    if strategy == "custom":
+        if not custom_text.strip():
+            raise ApiError(400, "missing_custom_text", "Texto personalizado é obrigatório.")
+        return _re.escape(custom_text), regex.IGNORECASE
+
+    if strategy == "regex":
+        if not regex_pattern.strip():
+            raise ApiError(400, "missing_regex_pattern", "Padrão regex é obrigatório.")
+        if len(regex_pattern) > MAX_REGEX_LENGTH:
+            raise ApiError(
+                400, "regex_too_long",
+                f"Padrão regex demasiado longo (máx {MAX_REGEX_LENGTH} caracteres).",
+            )
+        try:
+            regex.compile(regex_pattern)
+        except regex.error as exc:
+            raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
+        return regex_pattern, 0
+
+    return PATTERNS[strategy], 0
+
+
+def _extract_matches(
+    doc, *, strategy: str, custom_text: str, regex_pattern: str
+) -> list[RedactionMatch]:
+    """Find all matches across all pages. Used by both /preview and /redact."""
+    if doc.needs_pass:
+        raise ApiError(
+            400, "password_protected_pdf",
+            "Este PDF está protegido por palavra-passe. Remova a proteção antes de redactar.",
+        )
+    pattern_str, flags = _compile_pattern(strategy, custom_text, regex_pattern)
+    matches: list[RedactionMatch] = []
+
+    for page_idx, page in enumerate(doc):
+        text = page.get_text("text")
+        try:
+            iter_matches = list(
+                regex.finditer(pattern_str, text, flags=flags, timeout=REGEX_TIMEOUT_SECONDS)
+            )
+        except regex.error as exc:
+            raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
+        except TimeoutError as exc:
+            raise ApiError(
+                400, "regex_too_slow",
+                "O padrão regex é demasiado complexo (possível ReDoS). Simplifique-o.",
+            ) from exc
+
+        full_match_strings = {m.group() for m in iter_matches}
+
+        for match_str in full_match_strings:
+            for rect in page.search_for(match_str):
+                # Decompose the match rect into per-word bboxes for clean preview highlights.
+                words = page.get_text("words", clip=rect)
+                if not words:
+                    bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
+                    matches.append(_make_match(strategy, page_idx, bbox, match_str, match_str))
+                    continue
+                for w in words:
+                    bbox = (w[0], w[1], w[2], w[3])
+                    word_text = w[4]
+                    matches.append(_make_match(strategy, page_idx, bbox, word_text, match_str))
+
+    return matches
 
 
 def _trim_process_output(value: str, limit: int = 500) -> str:
@@ -633,100 +745,83 @@ def redact_pdf(
     strategy: str,
     custom_text: str = "",
     regex_pattern: str = "",
+    confirmed_ids: list[str] | None = None,
 ) -> bytes:
-    """Apply text redaction to a PDF."""
+    """Apply PII redaction. If confirmed_ids is None, redact every match.
+    If it is a list, redact only matches whose id is in the list (unknown ids
+    are silently skipped — the user's preview saw a set; we trust intent)."""
     import pymupdf
 
-    if strategy not in VALID_REDACTION_STRATEGIES:
-        raise ApiError(
-            status_code=400,
-            code="invalid_redaction_strategy",
-            message="Invalid redaction strategy.",
-        )
-
-    if strategy == "custom" and not custom_text.strip():
-        raise ApiError(
-            status_code=400,
-            code="missing_custom_text",
-            message="Custom text is required.",
-        )
-
-    if strategy == "regex":
-        if not regex_pattern.strip():
-            raise ApiError(
-                status_code=400,
-                code="missing_regex_pattern",
-                message="Regex pattern is required.",
-            )
-        if len(regex_pattern) > MAX_REGEX_LENGTH:
-            raise ApiError(
-                status_code=400,
-                code="regex_too_long",
-                message=f"Regex pattern too long (max {MAX_REGEX_LENGTH} chars).",
-            )
-        try:
-            re.compile(regex_pattern)
-        except re.error as exc:
-            raise ApiError(
-                status_code=400,
-                code="invalid_regex_pattern",
-                message="Invalid regex pattern.",
-            ) from exc
-
-    if strategy in PATTERNS:
-        pattern = PATTERNS[strategy]
-        flags = 0
-    elif strategy == "custom":
-        pattern = re.escape(custom_text)
-        flags = re.IGNORECASE
-    else:
-        pattern = regex_pattern
-        flags = 0
-
-    doc = None
     try:
         doc = pymupdf.open(stream=content, filetype="pdf")
     except Exception as exc:
-        raise ApiError(
-            status_code=400,
-            code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
-        ) from exc
+        raise ApiError(400, "invalid_pdf",
+            "Não foi possível abrir o PDF. Verifique se o ficheiro é válido.") from exc
 
     try:
-        with REDACTION_LOCK:
-            pymupdf.TOOLS.set_small_glyph_heights(True)
-            try:
-                for page in doc:
-                    text = page.get_text("text")
-                    matches = {match.group() for match in re.finditer(pattern, text, flags)}
-                    page_has_redactions = False
-                    for match_text in matches:
-                        rects = page.search_for(match_text)
-                        for rect in rects:
-                            page.add_redact_annot(rect, fill=(0, 0, 0))
-                            page_has_redactions = True
+        # _extract_matches raises 400 password_protected_pdf when applicable
+        all_matches = _extract_matches(
+            doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern,
+        )
 
-                    if page_has_redactions:
-                        page.apply_redactions(
+        if confirmed_ids is not None:
+            confirmed_set = set(confirmed_ids)
+            matches_to_apply = [m for m in all_matches if m.id in confirmed_set]
+        else:
+            matches_to_apply = all_matches
+
+        if matches_to_apply:
+            with REDACTION_LOCK:
+                pymupdf.TOOLS.set_small_glyph_heights(True)
+                try:
+                    pages_with_redactions: set[int] = set()
+                    for m in matches_to_apply:
+                        page = doc[m.page]
+                        page.add_redact_annot(pymupdf.Rect(*m.bbox), fill=(0, 0, 0))
+                        pages_with_redactions.add(m.page)
+
+                    for page_idx in pages_with_redactions:
+                        doc[page_idx].apply_redactions(
                             images=pymupdf.PDF_REDACT_IMAGE_NONE,
                             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                            text=pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
                         )
-            finally:
-                pymupdf.TOOLS.set_small_glyph_heights(False)
+                finally:
+                    pymupdf.TOOLS.set_small_glyph_heights(False)
 
-        return doc.tobytes(garbage=4, deflate=True)
+        # CRITICAL: strip residual sensitive data from outline/metadata/hidden text.
+        # Without this, the "redacted" PDF can still leak the redacted content via
+        # bookmark titles (EU AstraZeneca 2021), metadata (multiple), or OCR
+        # invisible layers (Epstein documents 2024). See spec for full citations.
+        # Runs UNCONDITIONALLY — even a no-match round-trip must strip metadata.
+        doc.scrub(
+            attached_files=True,
+            embedded_files=True,
+            hidden_text=True,
+            javascript=True,
+            metadata=True,
+            xml_metadata=True,
+            remove_links=True,
+            reset_fields=True,
+            reset_responses=True,
+            thumbnails=True,
+            clean_pages=True,
+            redactions=False,   # already applied above with explicit options
+            redact_images=0,
+        )
+        # scrub() does NOT touch the document outline (verified against pymupdf
+        # 1.27 docs). Clear the TOC explicitly so bookmark titles cannot leak
+        # — this is the exact EU AstraZeneca 2021 failure mode.
+        doc.set_toc([])
+
+        return doc.tobytes(garbage=4, deflate=True, clean=True)
     except ApiError:
         raise
     except Exception as exc:
-        raise ApiError(
-            status_code=500,
-            code="redaction_failed",
-            message="Nao foi possivel processar a redacao deste PDF.",
-        ) from exc
+        raise ApiError(500, "redaction_failed",
+            "Não foi possível processar a redacção deste PDF.") from exc
     finally:
-        if doc is not None:
-            doc.close()
+        doc.close()
 
 
 def build_health_payload() -> dict[str, Any]:
