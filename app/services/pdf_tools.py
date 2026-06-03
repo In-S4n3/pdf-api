@@ -151,6 +151,11 @@ def _extract_matches(
     doc, *, strategy: str, custom_text: str, regex_pattern: str
 ) -> list[RedactionMatch]:
     """Find all matches across all pages. Used by both /preview and /redact."""
+    if doc.needs_pass:
+        raise ApiError(
+            400, "password_protected_pdf",
+            "Este PDF está protegido por palavra-passe. Remova a proteção antes de redactar.",
+        )
     pattern_str, flags = _compile_pattern(strategy, custom_text, regex_pattern)
     matches: list[RedactionMatch] = []
 

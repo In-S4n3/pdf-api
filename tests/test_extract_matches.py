@@ -74,3 +74,15 @@ def test_extract_match_ids_are_stable_across_calls():
     ids1 = sorted(m.id for m in m1)
     ids2 = sorted(m.id for m in m2)
     assert ids1 == ids2
+
+
+def test_extract_encrypted_pdf_raises_400():
+    bytes_ = (Path(__file__).parent / "fixtures" / "encrypted.pdf").read_bytes()
+    doc = pymupdf.open(stream=bytes_, filetype="pdf")
+    try:
+        with pytest.raises(ApiError) as exc:
+            _extract_matches(doc, strategy="email", custom_text="", regex_pattern="")
+        assert exc.value.status_code == 400
+        assert exc.value.code == "password_protected_pdf"
+    finally:
+        doc.close()
