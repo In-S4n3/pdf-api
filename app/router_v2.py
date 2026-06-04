@@ -19,6 +19,7 @@ from app.services.pdf_tools import (
     flatten_pdf,
     ocr_pdf,
     pdf_first_page_to_image,
+    pdf_to_images,
     protect_pdf,
     redact_pdf,
 )
@@ -26,6 +27,7 @@ from app.v2_options import (
     EmptyOptions,
     FillFormOptions,
     OcrOptions,
+    PageSelection,
     PdfaOptions,
     PdfToImageOptions,
     ProtectOptions,
@@ -154,17 +156,17 @@ async def pdf_to_image_v2(
     _key: ApiKeyDep,
 ):
     content = await read_upload_bytes(file)
-    result, media_type, ext = await run_service(
-        pdf_first_page_to_image,
-        content,
-        options.format.value,
-    )
-    return file_response(
-        result,
-        media_type,
-        f"{filename_stem(file.filename)}.{ext}",
-        f"output.{ext}",
-    )
+    if options.pages == PageSelection.all:
+        result, media_type, ext = await run_service(
+            pdf_to_images, content, options.format.value,
+        )
+    else:
+        result, media_type, ext = await run_service(
+            pdf_first_page_to_image, content, options.format.value,
+        )
+    stem = filename_stem(file.filename)
+    fname = f"{stem}-imagens.zip" if ext == "zip" else f"{stem}.{ext}"
+    return file_response(result, media_type, fname, f"output.{ext}")
 
 
 @router.post("/protect")

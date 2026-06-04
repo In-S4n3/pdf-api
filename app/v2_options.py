@@ -53,8 +53,14 @@ class RedactionStrategy(StrEnum):
     regex = "regex"
 
 
+class PageSelection(StrEnum):
+    first = "first"
+    all = "all"
+
+
 class PdfToImageOptions(StrictOptionsModel):
     format: ImageFormat = ImageFormat.png
+    pages: PageSelection = PageSelection.first
 
 
 class OcrOptions(StrictOptionsModel):

@@ -462,6 +462,70 @@ def pdf_first_page_to_image(content: bytes, fmt: str) -> tuple[bytes, str, str]:
             doc.close()
 
 
+MAX_PAGES_FOR_IMAGES = 20
+
+
+def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
+    """Render all pages of a PDF to images and return a ZIP archive."""
+    import io
+    import zipfile
+
+    import pymupdf
+
+    doc = None
+    try:
+        doc = pymupdf.open(stream=content, filetype="pdf")
+    except Exception as exc:
+        raise ApiError(
+            status_code=400,
+            code="invalid_pdf",
+            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
+        ) from exc
+
+    try:
+        page_count = len(doc)
+        if page_count == 0:
+            raise ApiError(
+                status_code=400,
+                code="invalid_pdf",
+                message="O PDF nao contem paginas para converter.",
+            )
+
+        if page_count > MAX_PAGES_FOR_IMAGES:
+            raise ApiError(
+                status_code=400,
+                code="too_many_pages",
+                message=(
+                    f"O PDF tem {page_count} paginas (maximo: {MAX_PAGES_FOR_IMAGES}). "
+                    "Use a ferramenta Extrair Paginas para selecionar as paginas pretendidas."
+                ),
+            )
+
+        ext = "jpg" if fmt == "jpeg" else "png"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, page in enumerate(doc):
+                pix = page.get_pixmap(dpi=300)
+                if fmt == "jpeg":
+                    img_bytes = pix.tobytes("jpeg", jpg_quality=92)
+                else:
+                    img_bytes = pix.tobytes("png")
+                zf.writestr(f"pagina-{i + 1}.{ext}", img_bytes)
+
+        return buf.getvalue(), "application/zip", "zip"
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(
+            status_code=500,
+            code="conversion_failed",
+            message="Nao foi possivel converter este PDF para imagens.",
+        ) from exc
+    finally:
+        if doc is not None:
+            doc.close()
+
+
 def ocr_pdf(content: bytes, language: str) -> bytes:
     """Run OCRmyPDF with the requested language."""
     lang_code = LANGUAGE_MAP.get(language)

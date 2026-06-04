@@ -2,15 +2,17 @@
 
 import io
 import json
+import zipfile
 
 import pymupdf
 
 
-def _make_test_pdf() -> bytes:
+def _make_test_pdf(pages: int = 1) -> bytes:
     """Create a simple test PDF with text content."""
     doc = pymupdf.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), "Documento de teste para conversao", fontsize=12)
+    for i in range(pages):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Pagina {i + 1} de teste", fontsize=12)
     result = doc.tobytes()
     doc.close()
     return result
@@ -144,3 +146,78 @@ def test_png_output_has_reasonable_size(client):
     )
     assert response.status_code == 200
     assert len(response.content) > 1000
+
+
+# -- Multi-page (all pages → ZIP) --
+
+
+def test_all_pages_returns_zip(client):
+    """pages=all returns a ZIP archive with one image per page."""
+    pdf_bytes = _make_test_pdf(pages=3)
+    response = client.post(
+        "/v2/pdf-to-image",
+        files={"file": ("doc.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"options": json.dumps({"format": "png", "pages": "all"})},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    zf = zipfile.ZipFile(io.BytesIO(response.content))
+    assert len(zf.namelist()) == 3
+    assert "pagina-1.png" in zf.namelist()
+    assert "pagina-3.png" in zf.namelist()
+    for name in zf.namelist():
+        assert zf.read(name)[:4] == b"\x89PNG"
+
+
+def test_all_pages_jpeg_format(client):
+    """pages=all with format=jpeg returns ZIP of JPEGs."""
+    pdf_bytes = _make_test_pdf(pages=2)
+    response = client.post(
+        "/v2/pdf-to-image",
+        files={"file": ("doc.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"options": json.dumps({"format": "jpeg", "pages": "all"})},
+    )
+    assert response.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(response.content))
+    assert len(zf.namelist()) == 2
+    assert "pagina-1.jpg" in zf.namelist()
+    for name in zf.namelist():
+        assert zf.read(name)[:2] == b"\xff\xd8"
+
+
+def test_all_pages_zip_content_disposition(client):
+    """ZIP response has correct Content-Disposition filename."""
+    pdf_bytes = _make_test_pdf(pages=2)
+    response = client.post(
+        "/v2/pdf-to-image",
+        files={"file": ("relatorio.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"options": json.dumps({"pages": "all"})},
+    )
+    assert response.status_code == 200
+    assert "relatorio-imagens.zip" in response.headers.get("content-disposition", "")
+
+
+def test_too_many_pages_returns_400(client):
+    """PDF with >20 pages and pages=all returns 400 too_many_pages."""
+    pdf_bytes = _make_test_pdf(pages=21)
+    response = client.post(
+        "/v2/pdf-to-image",
+        files={"file": ("big.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"options": json.dumps({"pages": "all"})},
+    )
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "too_many_pages"
+
+
+def test_first_page_backward_compat(client):
+    """pages=first (default) still returns single image, not ZIP."""
+    pdf_bytes = _make_test_pdf(pages=5)
+    response = client.post(
+        "/v2/pdf-to-image",
+        files={"file": ("test.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        data={"options": json.dumps({"format": "png", "pages": "first"})},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content[:4] == b"\x89PNG"
