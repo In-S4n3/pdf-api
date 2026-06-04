@@ -322,7 +322,7 @@ def _convert_office(content: bytes, content_type: str) -> bytes:
                 f"-env:UserInstallation=file://{tmpdir}/profile",
                 str(input_path),
             ],
-            timeout=120,
+            timeout=55,
             missing_message="LibreOffice não está disponível neste ambiente.",
         )
 
@@ -357,7 +357,7 @@ def _convert_image_with_libreoffice(content: bytes, content_type: str) -> bytes:
                 f"-env:UserInstallation=file://{tmpdir}/profile",
                 str(input_path),
             ],
-            timeout=120,
+            timeout=55,
             missing_message="LibreOffice não está disponível neste ambiente.",
         )
 
@@ -497,7 +497,7 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 str(input_path),
                 str(output_path),
             ],
-            timeout=120,
+            timeout=55,
             missing_message="OCRmyPDF não está disponível neste ambiente.",
         )
 
@@ -576,7 +576,7 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
                 str(pdfa_definition_path),
                 str(input_path),
             ],
-            timeout=120,
+            timeout=55,
             missing_message="Ghostscript não está disponível neste ambiente.",
         )
 
