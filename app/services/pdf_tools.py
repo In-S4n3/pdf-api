@@ -223,7 +223,7 @@ def _run_command(
         raise ApiError(
             status_code=504,
             code="processing_timeout",
-            message="The processing tool timed out before completing the request.",
+            message="O processamento excedeu o tempo limite. Tente com um ficheiro mais pequeno.",
         ) from exc
 
 
@@ -323,7 +323,7 @@ def _convert_office(content: bytes, content_type: str) -> bytes:
                 str(input_path),
             ],
             timeout=120,
-            missing_message="LibreOffice is not available in this environment.",
+            missing_message="LibreOffice não está disponível neste ambiente.",
         )
 
         if result.returncode != 0 or not output_path.exists():
@@ -358,7 +358,7 @@ def _convert_image_with_libreoffice(content: bytes, content_type: str) -> bytes:
                 str(input_path),
             ],
             timeout=120,
-            missing_message="LibreOffice is not available in this environment.",
+            missing_message="LibreOffice não está disponível neste ambiente.",
         )
 
         if result.returncode != 0 or not output_path.exists():
@@ -470,8 +470,8 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
             status_code=400,
             code="unsupported_language",
             message=(
-                f"Unsupported language: {language}. "
-                f"Supported: {', '.join(LANGUAGE_MAP.keys())}"
+                f"Idioma não suportado: {language}. "
+                f"Suportados: {', '.join(LANGUAGE_MAP.keys())}"
             ),
         )
 
@@ -498,7 +498,7 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 str(output_path),
             ],
             timeout=120,
-            missing_message="OCRmyPDF is not available in this environment.",
+            missing_message="OCRmyPDF não está disponível neste ambiente.",
         )
 
         if result.returncode == 2:
@@ -534,8 +534,8 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
             status_code=400,
             code="invalid_conformance",
             message=(
-                f"Invalid conformance level: {conformance}. "
-                f"Supported: {', '.join(CONFORMANCE_MAP.keys())}"
+                f"Nível de conformidade inválido: {conformance}. "
+                f"Suportados: {', '.join(CONFORMANCE_MAP.keys())}"
             ),
         )
 
@@ -545,7 +545,7 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
         raise ApiError(
             status_code=503,
             code="tool_unavailable",
-            message="Ghostscript PDF/A resources are not available in this environment.",
+            message="Os recursos Ghostscript para PDF/A não estão disponíveis neste ambiente.",
         )
 
     template_text = pdfa_definition_template.read_text(encoding="latin-1")
@@ -577,7 +577,7 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
                 str(input_path),
             ],
             timeout=120,
-            missing_message="Ghostscript is not available in this environment.",
+            missing_message="Ghostscript não está disponível neste ambiente.",
         )
 
         if result.returncode != 0 or not output_path.exists():
@@ -628,7 +628,7 @@ def protect_pdf(content: bytes, password: str) -> bytes:
         raise ApiError(
             status_code=400,
             code="invalid_password",
-            message="Password is required.",
+            message="A palavra-passe é obrigatória.",
         )
 
     pdf = _open_pikepdf(content)
@@ -660,7 +660,7 @@ def protect_pdf(content: bytes, password: str) -> bytes:
         raise ApiError(
             status_code=500,
             code="protection_failed",
-            message="Failed to protect PDF.",
+            message="Não foi possível proteger o PDF.",
         ) from exc
     finally:
         pdf.close()
@@ -709,7 +709,7 @@ def fill_form_pdf(
         raise ApiError(
             status_code=400,
             code="missing_form_values",
-            message="No field values provided.",
+            message="Nenhum valor de campo fornecido.",
         )
 
     pdf = _open_pikepdf(content)
@@ -718,7 +718,7 @@ def fill_form_pdf(
         raise ApiError(
             status_code=400,
             code="missing_form_fields",
-            message="PDF has no form fields.",
+            message="Este PDF não contém campos de formulário.",
         )
 
     try:
@@ -737,7 +737,7 @@ def fill_form_pdf(
             raise ApiError(
                 status_code=422,
                 code="unknown_form_fields",
-                message="Some field names do not exist in the uploaded PDF form.",
+                message="Alguns nomes de campo não existem no formulário PDF carregado.",
                 details={"unknownFields": sorted(unknown_fields)},
             )
 
@@ -751,7 +751,7 @@ def fill_form_pdf(
         raise ApiError(
             status_code=500,
             code="form_processing_failed",
-            message="Failed to process form.",
+            message="Não foi possível processar o formulário.",
         ) from exc
     finally:
         pdf.close()
