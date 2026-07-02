@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 MAX_PAGES = 200  # coarse guard; the 55s subprocess timeout is the real runtime bound
 
+# pdf_to_xlsx caps (in-process; see 2026-07-02-pdf-para-excel-design.md §3.2).
+MAX_TABLES = 200  # cap total worksheets
+MAX_CELLS = 500_000  # cap total cells written — bounds the in-memory openpyxl workbook
+MAX_PATHS_PER_PAGE = 5000  # reject vector-graphics-bomb pages before find_tables clustering
+
 OFFICE_MIMES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -996,6 +1001,132 @@ def pdf_to_docx(content: bytes) -> bytes:
             )
 
         return output_path.read_bytes()
+
+
+def _sheet_title(pno: int, ti: int) -> str:
+    """Build a worksheet title for the table `ti` on page `pno`.
+
+    openpyxl forbids ``* ? : / [ ] \\`` and caps titles at 31 chars; this format
+    uses none of those and stays well within 31 chars for MAX_PAGES/MAX_TABLES.
+    Duplicates are auto-deduped by openpyxl; the [:31] slice is defensive only.
+    """
+    return f"Pag {pno} Tabela {ti}"[:31]
+
+
+def pdf_to_xlsx(content: bytes) -> bytes:
+    """Extract tables from a text PDF into an .xlsx (one sheet per table).
+
+    Guard order is load-bearing: invalid -> encrypted -> page-cap (all cheap,
+    before the loop) -> per-page complexity -> per-table cells-cap. The
+    scanned-vs-no-tables decision is deferred until after extraction so a sparse
+    legit table is not pre-rejected by the text-density gate. The whole body is
+    wrapped in try/except -> ApiError(500) because main.py has no catch-all
+    handler, so a raw find_tables()/openpyxl exception would escape as a
+    code-less plain-text 500 that the FE cannot render.
+    """
+    from io import BytesIO
+
+    import pymupdf
+    from openpyxl import Workbook
+
+    try:
+        doc = pymupdf.open(stream=content, filetype="pdf")
+    except Exception as exc:
+        raise ApiError(
+            400,
+            "invalid_pdf",
+            "Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
+        ) from exc
+
+    try:
+        # --- Cheap pre-flight (reuse pdf_to_docx codes/messages) ---
+        if doc.needs_pass:
+            raise ApiError(
+                400,
+                "password_protected_pdf",
+                "Este PDF está protegido por palavra-passe. Desbloqueie-o antes de converter.",
+            )
+        if doc.page_count > MAX_PAGES:
+            raise ApiError(
+                400,
+                "too_many_pages",
+                "PDF demasiado grande. Divida-o antes de converter.",
+            )
+
+        wb = Workbook()
+        wb.remove(wb.active)  # start with zero sheets
+        n_tables, n_cells = 0, 0
+        for pno, page in enumerate(doc, start=1):
+            # Complexity: reject a vector-graphics bomb before find_tables' O(n²) clustering.
+            if len(page.get_cdrawings()) > MAX_PATHS_PER_PAGE:
+                raise ApiError(
+                    422,
+                    "pdf_too_complex",
+                    "Página demasiado complexa para extrair tabelas com segurança.",
+                )
+            for ti, tab in enumerate(page.find_tables().tables, start=1):
+                rows = tab.extract()
+                if not rows:
+                    continue
+                n_cells += sum(len(r) for r in rows)
+                if n_cells > MAX_CELLS:  # memory cap
+                    raise ApiError(
+                        422,
+                        "pdf_too_complex",
+                        "Demasiadas células para um só ficheiro.",
+                    )
+                n_tables += 1
+                ws = wb.create_sheet(title=_sheet_title(pno, ti))
+                for r_idx, row in enumerate(rows, start=1):
+                    for c_idx, val in enumerate(row, start=1):
+                        cell = ws.cell(
+                            row=r_idx,
+                            column=c_idx,
+                            value=("" if val is None else str(val)),
+                        )
+                        # Neutralize formula ('f') / error ('e') injection: a cell
+                        # like "=HYPERLINK(...)" would otherwise ship as a live
+                        # formula, and "=1+1"/"#REF!" would render as an error.
+                        if cell.data_type in ("f", "e"):
+                            cell.data_type = "s"
+                if n_tables >= MAX_TABLES:
+                    break
+            if n_tables >= MAX_TABLES:
+                break
+
+        if n_tables == 0:
+            # Decide scanned-vs-no-tables AFTER extraction: a sparse legit table
+            # must not be pre-rejected by the text-density gate, and a scanned
+            # PDF yields zero tables and lands here anyway.
+            total_chars = sum(len("".join(p.get_text().split())) for p in doc)
+            if total_chars < doc.page_count * 10:
+                raise ApiError(
+                    422,
+                    "scanned_pdf",
+                    "Não foi possível extrair texto deste PDF. "
+                    "Se for digitalizado, use a ferramenta OCR primeiro.",
+                )
+            raise ApiError(
+                422,
+                "no_tables_detected",
+                "Não encontrámos tabelas neste PDF. Esta ferramenta extrai tabelas; "
+                "para converter texto corrido use o PDF para Word.",
+            )
+
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    except ApiError:
+        raise
+    except Exception as exc:
+        logger.error("pdf_to_xlsx failed: %s", exc)
+        raise ApiError(
+            500,
+            "conversion_failed",
+            "Falha na conversão do PDF para Excel.",
+        ) from exc
+    finally:
+        doc.close()
 
 
 def build_health_payload() -> dict[str, Any]:
