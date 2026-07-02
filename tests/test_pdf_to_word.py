@@ -81,3 +81,39 @@ def test_empty_docx_helper(tmp_path: Path):
     d.add_paragraph("Olá mundo")
     d.save(filled)
     assert _docx_is_effectively_empty(filled) is False
+
+
+def test_v2_pdf_to_word_text_returns_200(client):
+    pdf_bytes = io.BytesIO(_text_pdf(text="Relatorio 98765"))
+    response = client.post(
+        "/v2/pdf-to-word",
+        files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert response.headers["content-disposition"].endswith('.docx"')
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+        assert "word/document.xml" in zf.namelist()
+
+
+def test_v2_pdf_to_word_scanned_returns_422_envelope(client):
+    response = client.post(
+        "/v2/pdf-to-word",
+        files={"file": ("scan.pdf", io.BytesIO(_blank_pdf()), "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "scanned_pdf"
+
+
+def test_v2_pdf_to_word_encrypted_returns_400_envelope(client):
+    response = client.post(
+        "/v2/pdf-to-word",
+        files={"file": ("enc.pdf", io.BytesIO(_encrypted_pdf()), "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "password_protected_pdf"

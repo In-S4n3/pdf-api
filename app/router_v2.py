@@ -19,6 +19,7 @@ from app.services.pdf_tools import (
     flatten_pdf,
     ocr_pdf,
     pdf_first_page_to_image,
+    pdf_to_docx,
     pdf_to_images,
     protect_pdf,
     redact_pdf,
@@ -97,6 +98,22 @@ async def convert_v2(
         "application/pdf",
         f"{filename_stem(file.filename)}.pdf",
         "output.pdf",
+    )
+
+
+@router.post("/pdf-to-word")
+async def pdf_to_word_v2(
+    file: UploadedFile,
+    _options: EmptyOptionsDep,
+    _key: ApiKeyDep,
+):
+    content = await read_upload_bytes(file)
+    result = await run_service(pdf_to_docx, content)
+    return file_response(
+        result,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        f"{filename_stem(file.filename)}.docx",
+        "output.docx",
     )
 
 
