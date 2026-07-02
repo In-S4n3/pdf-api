@@ -8,10 +8,12 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.135.0",
     "img2pdf>=0.6.0",
-    "pymupdf>=1.27.0",
+    "pymupdf>=1.27.0,<1.28",
     "pikepdf>=10.5.0",
     "ocrmypdf>=16.0.0",
     "regex>=2024.11.6",
+    "pdf2docx==0.5.13",
+    "opencv-python-headless==4.11.0.86",
 ]
 
 [dependency-groups]

@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unpaper \
     fonts-liberation \
     fonts-dejavu \
+    libglib2.0-0 \
+    libxcb1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -56,6 +58,9 @@ RUN if [ "$INSTALL_DEV" = "true" ]; then \
 
 # Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"
+
+# Fail the build fast if opencv/pdf2docx native deps can't import (arch/version drift guard)
+RUN python -c "import cv2, pdf2docx, docx"
 
 # Expose port
 EXPOSE 8080

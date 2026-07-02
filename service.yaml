@@ -1,0 +1,18 @@
+# Cloud Run config for pdf-api (europe-west1). Apply with:
+#   gcloud run services replace service.yaml --region=europe-west1
+# pdf-para-word (pdf2docx + opencv) needs the 2Gi/concurrency=1 floor or it OOMs.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: pdf-api
+spec:
+  template:
+    spec:
+      containerConcurrency: 1
+      timeoutSeconds: 60
+      containers:
+        - image: IMAGE_PLACEHOLDER  # set by the deploy pipeline
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
