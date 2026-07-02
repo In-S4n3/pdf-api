@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import re as _re
 import subprocess
 import tempfile
@@ -11,6 +12,10 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+MAX_PAGES = 200  # coarse guard; the 55s subprocess timeout is the real runtime bound
 
 import img2pdf
 import regex
@@ -904,6 +909,93 @@ def redact_pdf(
             "Não foi possível processar a redacção deste PDF.") from exc
     finally:
         doc.close()
+
+
+def _docx_is_effectively_empty(path: Path) -> bool:
+    """True when the produced docx has no non-whitespace text and no tables.
+
+    pdf2docx swallows per-page errors (ignore_page_error=True) and exits 0,
+    so a scanned/degraded PDF yields a valid-but-empty docx no exception flags.
+    """
+    from docx import Document
+
+    document = Document(str(path))
+    has_text = any(p.text.strip() for p in document.paragraphs)
+    return not has_text and len(document.tables) == 0
+
+
+def pdf_to_docx(content: bytes) -> bytes:
+    """Convert a text-based PDF to an editable .docx via the pdf2docx CLI.
+
+    Guard order is load-bearing: encrypted before page access, page cap before
+    the get_text loop, then the scanned/empty-text gate.
+    """
+    import pymupdf
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = Path(tmpdir) / "input.pdf"
+        output_path = Path(tmpdir) / "output.docx"
+        input_path.write_bytes(content)
+
+        try:
+            doc = pymupdf.open(stream=content, filetype="pdf")
+        except Exception as exc:
+            raise ApiError(
+                status_code=400,
+                code="invalid_pdf",
+                message="Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
+            ) from exc
+
+        try:
+            if doc.needs_pass:
+                raise ApiError(
+                    status_code=400,
+                    code="password_protected_pdf",
+                    message="Este PDF está protegido por palavra-passe. Desbloqueie-o antes de converter.",
+                )
+            if doc.page_count > MAX_PAGES:
+                raise ApiError(
+                    status_code=400,
+                    code="too_many_pages",
+                    message="PDF demasiado grande. Divida-o antes de converter.",
+                )
+            total_chars = sum(len("".join(page.get_text().split())) for page in doc)
+            if total_chars < doc.page_count * 10:
+                raise ApiError(
+                    status_code=422,
+                    code="scanned_pdf",
+                    message=(
+                        "Este PDF parece digitalizado (sem texto selecionável). "
+                        "Use a ferramenta OCR primeiro e depois converta."
+                    ),
+                )
+        finally:
+            doc.close()
+
+        result = _run_command(
+            ["pdf2docx", "convert", str(input_path), str(output_path)],
+            timeout=55,
+            missing_message="Conversor indisponível neste ambiente.",
+        )
+        if result.returncode != 0 or not output_path.exists():
+            logger.error("pdf2docx failed: %s", _trim_process_output(result.stderr))
+            raise ApiError(
+                status_code=500,
+                code="conversion_failed",
+                message="Falha na conversão do PDF para Word.",
+            )
+
+        if _docx_is_effectively_empty(output_path):
+            raise ApiError(
+                status_code=422,
+                code="scanned_pdf",
+                message=(
+                    "Não foi possível extrair texto deste PDF. "
+                    "Se for digitalizado, use a ferramenta OCR primeiro."
+                ),
+            )
+
+        return output_path.read_bytes()
 
 
 def build_health_payload() -> dict[str, Any]:
