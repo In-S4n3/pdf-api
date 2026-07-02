@@ -134,3 +134,51 @@ def test_sheet_title_unique_forbidden_char_free_and_bounded():
             assert not (set(title) & forbidden)
             assert title not in seen  # (pno, ti) pairs are inherently unique
             seen.add(title)
+
+
+# --- HTTP-level (TestClient, /v2 envelope) ----------------------------------
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def test_v2_pdf_to_excel_happy_returns_200(client):
+    response = client.post(
+        "/v2/pdf-to-excel",
+        files={"file": ("test.pdf", io.BytesIO(g.tables_pdf()), "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == XLSX_MIME
+    assert response.headers["content-disposition"].endswith('.xlsx"')
+    wb = load_workbook(io.BytesIO(response.content))
+    assert wb.worksheets[0]["A1"].value == "Produto"
+
+
+def test_v2_pdf_to_excel_prose_returns_422_envelope(client):
+    response = client.post(
+        "/v2/pdf-to-excel",
+        files={"file": ("prose.pdf", io.BytesIO(g.prose_pdf()), "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "no_tables_detected"
+
+
+def test_v2_pdf_to_excel_scanned_returns_422_envelope(client):
+    response = client.post(
+        "/v2/pdf-to-excel",
+        files={"file": ("scan.pdf", io.BytesIO(g.blank_pdf()), "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "scanned_pdf"
+
+
+def test_v2_pdf_to_excel_encrypted_returns_400_envelope(client):
+    response = client.post(
+        "/v2/pdf-to-excel",
+        files={"file": ("enc.pdf", io.BytesIO(ENCRYPTED_PDF.read_bytes()), "application/pdf")},
+        data={"options": "{}"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "password_protected_pdf"
