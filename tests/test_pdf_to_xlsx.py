@@ -93,6 +93,14 @@ def test_complexity_guard_raises_422(monkeypatch):
     assert exc.value.code == "pdf_too_complex"
 
 
+def test_cells_cap_trips_pdf_too_complex(monkeypatch):
+    monkeypatch.setattr(pdf_tools, "MAX_CELLS", 3)
+    with pytest.raises(ApiError) as exc:
+        pdf_to_xlsx(g.tables_pdf())
+    assert exc.value.status_code == 422
+    assert exc.value.code == "pdf_too_complex"
+
+
 # --- regression guard: sparse legit table must NOT be pre-rejected ----------
 
 
