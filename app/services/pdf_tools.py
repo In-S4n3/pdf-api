@@ -13,14 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
-MAX_PAGES = 200  # coarse guard; the 55s subprocess timeout is the real runtime bound
-
 import img2pdf
 import regex
 
 from app.api_errors import ApiError
+
+logger = logging.getLogger(__name__)
+
+MAX_PAGES = 200  # coarse guard; the 55s subprocess timeout is the real runtime bound
 
 OFFICE_MIMES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
