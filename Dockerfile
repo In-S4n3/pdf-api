@@ -60,7 +60,7 @@ RUN if [ "$INSTALL_DEV" = "true" ]; then \
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Fail the build fast if opencv/pdf2docx native deps can't import (arch/version drift guard)
-RUN python -c "import cv2, pdf2docx, docx"
+RUN python -c "import cv2, pdf2docx, docx, openpyxl"
 
 # Expose port
 EXPOSE 8080
