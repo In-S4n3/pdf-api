@@ -75,6 +75,12 @@ class ProtectOptions(StrictOptionsModel):
     userPassword: Annotated[str, Field(min_length=1)]
 
 
+class UnlockOptions(StrictOptionsModel):
+    # Optional: owner-restriction-only PDFs (empty user password) unlock with
+    # no password at all; only user-password PDFs need it supplied.
+    password: str = ""
+
+
 class FillFormOptions(StrictOptionsModel):
     fields: dict[str, JsonScalar] = Field(min_length=1)
 
