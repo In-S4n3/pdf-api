@@ -740,6 +740,92 @@ def protect_pdf(content: bytes, password: str) -> bytes:
         pdf.close()
 
 
+def _unsupported_encryption(exc: Exception) -> ApiError:
+    return ApiError(
+        status_code=422,
+        code="unsupported_encryption",
+        message=(
+            "Não foi possível abrir este PDF. A cifra pode não ser suportada "
+            "(ex. certificado) ou o ficheiro está corrompido."
+        ),
+    )
+
+
+def _open_for_unlock(content: bytes, password: str):
+    """Open an encrypted PDF for decryption: try no password first (owner-only
+    PDFs have an empty user password), then the supplied one.
+
+    Every open failure — on EITHER attempt — maps to a typed ApiError so a
+    corrupt/unsupported file never leaks a 500. A PdfError on the retry open
+    must be caught here: a sibling ``except`` clause does not catch exceptions
+    raised inside another handler.
+    """
+    import pikepdf
+
+    try:
+        return pikepdf.open(io.BytesIO(content))  # no password first
+    except pikepdf.PasswordError:
+        pass  # needs a real open password — fall through
+    except pikepdf.PdfError as exc:
+        raise _unsupported_encryption(exc) from exc
+
+    if not password:
+        raise ApiError(
+            status_code=400,
+            code="password_required",
+            message="Este PDF precisa de uma palavra-passe para abrir.",
+        )
+    try:
+        return pikepdf.open(io.BytesIO(content), password=password)  # fresh buffer
+    except pikepdf.PasswordError as exc:
+        raise ApiError(
+            status_code=400,
+            code="wrong_password",
+            message="Palavra-passe incorreta.",
+        ) from exc
+    except pikepdf.PdfError as exc:
+        raise _unsupported_encryption(exc) from exc
+
+
+def unlock_pdf(content: bytes, password: str = "") -> bytes:
+    """Remove password/permission encryption from a PDF.
+
+    The only tool whose input is legitimately encrypted. Two cases:
+      * owner-restriction-only PDF (empty user password) -> opens with NO
+        password; saving without encryption strips the restrictions.
+      * user (open) password PDF -> needs the supplied password to open.
+    pikepdf never raises when a password is passed to a non-encrypted PDF, so
+    the not_encrypted case is detected with an explicit is_encrypted check.
+    """
+    pdf = _open_for_unlock(content, password)
+    try:
+        if not pdf.is_encrypted:
+            raise ApiError(
+                status_code=422,
+                code="not_encrypted",
+                message="Este PDF não está protegido — não há nada a desbloquear.",
+            )
+        if len(pdf.pages) > MAX_PAGES:
+            raise ApiError(
+                status_code=400,
+                code="too_many_pages",
+                message=f"O PDF tem demasiadas páginas (máximo: {MAX_PAGES}).",
+            )
+        buf = io.BytesIO()
+        pdf.save(buf, encryption=False)  # explicit: strip all encryption/permissions
+        return buf.getvalue()
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(
+            status_code=500,
+            code="unlock_failed",
+            message="Não foi possível desbloquear o PDF.",
+        ) from exc
+    finally:
+        pdf.close()
+
+
 def _set_field_value(field: Any, value: Any) -> None:
     import pikepdf
     from pikepdf.form import (

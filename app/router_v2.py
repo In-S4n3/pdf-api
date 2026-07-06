@@ -24,6 +24,7 @@ from app.services.pdf_tools import (
     pdf_to_xlsx,
     protect_pdf,
     redact_pdf,
+    unlock_pdf,
 )
 from app.v2_options import (
     EmptyOptions,
@@ -35,6 +36,7 @@ from app.v2_options import (
     ProtectOptions,
     RedactOptions,
     RedactPreviewOptions,
+    UnlockOptions,
     options_dependency,
 )
 
@@ -47,6 +49,7 @@ OcrOptionsDep = Annotated[OcrOptions, options_dependency(OcrOptions)]
 PdfaOptionsDep = Annotated[PdfaOptions, options_dependency(PdfaOptions)]
 PdfToImageOptionsDep = Annotated[PdfToImageOptions, options_dependency(PdfToImageOptions)]
 ProtectOptionsDep = Annotated[ProtectOptions, options_dependency(ProtectOptions)]
+UnlockOptionsDep = Annotated[UnlockOptions, options_dependency(UnlockOptions)]
 RedactOptionsDep = Annotated[RedactOptions, options_dependency(RedactOptions)]
 RedactPreviewOptionsDep = Annotated[
     RedactPreviewOptions, options_dependency(RedactPreviewOptions)
@@ -211,6 +214,17 @@ async def protect_v2(
 ):
     content = await read_upload_bytes(file)
     result = await run_service(protect_pdf, content, options.userPassword)
+    return file_response(result, "application/pdf", file.filename, "output.pdf")
+
+
+@router.post("/pdf-unlock")
+async def pdf_unlock_v2(
+    file: UploadedFile,
+    options: UnlockOptionsDep,
+    _key: ApiKeyDep,
+):
+    content = await read_upload_bytes(file)
+    result = await run_service(unlock_pdf, content, options.password)
     return file_response(result, "application/pdf", file.filename, "output.pdf")
 
 
