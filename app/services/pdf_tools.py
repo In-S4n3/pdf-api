@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import re as _re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -1271,90 +1273,57 @@ def build_health_payload() -> dict[str, Any]:
 _REPAIR_UNRECOVERABLE = "Não foi possível reparar o PDF — está demasiado danificado."
 
 
-def _has_acroform(pdf) -> bool:
-    try:
-        return pdf.Root.get("/AcroForm") is not None
-    except Exception:
-        return False
-
-
-def _has_syntax_issues(content: bytes) -> bool:
-    """True if the INPUT already has detectable syntax problems (drives already-healthy)."""
-    import pikepdf
-
-    try:
-        pdf = pikepdf.open(io.BytesIO(content))
-    except pikepdf.PdfError:
-        return True
-    try:
-        return len(pdf.check_pdf_syntax()) > 0
-    finally:
-        pdf.close()
-
-
 def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
-    """Repair a corrupt PDF. Returns (output_bytes, X-Repair-* headers)."""
-    import pikepdf
+    """Repair a corrupt PDF. Returns (output_bytes, X-Repair-* headers).
 
-    # Pre-check A: magic bytes (LIVENESS, not a security boundary)
+    Tier-1 pikepdf work runs in a memory+time-bounded SUBPROCESS (app.services.
+    _repair_worker) so a decompression bomb expands in a killable child, never in
+    this API worker. On escalation the parent runs the (already sandboxed) gs Tier-2.
+    """
+    # Pre-check: magic bytes (liveness only — cheap, no decompression)
     if b"%PDF-" not in content[:1024]:
         raise ApiError(status_code=400, code="not_a_pdf",
                        message="O ficheiro não é um PDF válido.")
 
-    # Tier 1: pikepdf structure repair (attempt_recovery=True is the default)
-    try:
-        pdf = pikepdf.open(io.BytesIO(content))
-    except pikepdf.PasswordError as exc:  # SIBLING of PdfError — own handler, FIRST
-        raise ApiError(status_code=400, code="password_protected",
-                       message="PDF protegido por palavra-passe. Use Desbloquear PDF primeiro.") from exc
-    except pikepdf.PdfError:
-        return _repair_with_ghostscript(content, baseline=None)  # open failed -> Tier 2
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.pdf")
+        out_path = os.path.join(tmp, "out.pdf")
+        meta_path = os.path.join(tmp, "meta.json")
+        with open(in_path, "wb") as fh:
+            fh.write(content)
+        cmd = [sys.executable, "-m", "app.services._repair_worker", in_path, out_path, meta_path]
+        result, stderr = _run_guarded(cmd, timeout=REPAIR_WORKER_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
+        if result == "timeout":
+            raise ApiError(status_code=422, code="repair_timeout",
+                           message="O PDF é demasiado complexo para reparar no tempo disponível.")
+        if result == "oom":
+            raise ApiError(status_code=422, code="repair_oom",
+                           message="O PDF é demasiado grande ou complexo para reparar.")
+        if result != "ok" or not os.path.exists(meta_path):
+            logger.warning("repair worker failed (result=%s): %s", result, stderr[:2000])
+            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
 
-    try:
-        try:
-            m = len(pdf.pages)  # pages recoverable AT OPEN TIME (post-recovery, not pristine)
-        except Exception:
-            return _repair_with_ghostscript(content, baseline=None)
-        buf = io.BytesIO()
-        pdf.save(buf)  # rebuild xref/trailer, non-incremental
-        out_bytes = buf.getvalue()
-    finally:
-        pdf.close()
+        outcome = meta.get("outcome")
+        if outcome == "ok":
+            out_bytes = Path(out_path).read_bytes()
+            return out_bytes, meta["headers"]
+        if outcome == "error":
+            raise ApiError(status_code=meta["status"], code=meta["code"], message=meta["message"])
+        # outcome == "escalate" — baseline captured; run Tier-2 outside the tempdir
+        baseline = meta.get("baseline")
 
-    # Verdict via pikepdf-native check_pdf_syntax() (empty list == clean)
-    input_dirty = _has_syntax_issues(content)
-    reopened = pikepdf.open(io.BytesIO(out_bytes))
-    try:
-        output_dirty = len(reopened.check_pdf_syntax()) > 0
-        n = len(reopened.pages)
-    finally:
-        reopened.close()
-
-    if output_dirty or n == 0:  # residual damage save() couldn't fix -> deeper repair
-        return _repair_with_ghostscript(content, baseline=m)
-
-    if n < m:
-        status = "partial"          # real page loss ONLY
-    elif not input_dirty:
-        status = "already-healthy"  # input was already clean
-    else:
-        status = "repaired"
-
-    headers = {
-        "X-Repair-Status": status,
-        "X-Repair-Method": "pikepdf",
-        "X-Repair-Pages": f"{n}/{m}",
-        "X-Repair-Warnings": "false",
-    }
-    return out_bytes, headers
+    return _repair_with_ghostscript(content, baseline)
 
 
+REPAIR_WORKER_TIMEOUT = 15   # Tier-1 pikepdf budget (bomb guard); + GS_REPAIR_TIMEOUT(40) < 60s Cloud Run wall
 GS_REPAIR_TIMEOUT = 40                       # seconds, under the shared 60s Cloud Run wall
 GS_REPAIR_MAX_BYTES = 30 * 1024 * 1024       # do not spend the gs budget on >30MB
 GS_REPAIR_MEM_BYTES = 1536 * 1024 * 1024     # 1.5 GiB rlimit, under the 2Gi container
 
 
-def _run_gs_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, str]:
+def _run_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, str]:
     """Run gs with a memory rlimit + own process group. Returns (result, stderr)."""
     import resource
 
@@ -1404,7 +1373,7 @@ def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[byte
             "-dDetectDuplicateImages=false",
             "-sDEVICE=pdfwrite", "-o", out_path, in_path,
         ]
-        result, _stderr = _run_gs_guarded(cmd, timeout=GS_REPAIR_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
+        result, stderr = _run_guarded(cmd, timeout=GS_REPAIR_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
         if result == "timeout":
             raise ApiError(status_code=422, code="repair_timeout",
                            message="O PDF é demasiado complexo para reparar no tempo disponível.")
@@ -1412,6 +1381,7 @@ def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[byte
             raise ApiError(status_code=422, code="repair_oom",
                            message="O PDF é demasiado grande ou complexo para reparar.")
         if result != "ok" or not os.path.exists(out_path):
+            logger.warning("ghostscript repair failed (result=%s): %s", result, stderr[:2000])
             raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
         out_bytes = Path(out_path).read_bytes()
 
@@ -1426,9 +1396,10 @@ def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[byte
     if k == 0:
         raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
 
+    pages_header = f"{k}/{baseline}" if baseline is not None else str(k)
     return out_bytes, {
         "X-Repair-Status": "reinterpreted-lossy",
         "X-Repair-Method": "ghostscript",
-        "X-Repair-Pages": str(k),
+        "X-Repair-Pages": pages_header,
         "X-Repair-Warnings": "true",
     }
