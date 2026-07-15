@@ -24,6 +24,7 @@ from app.services.pdf_tools import (
     pdf_to_xlsx,
     protect_pdf,
     redact_pdf,
+    repair_pdf,
     unlock_pdf,
 )
 from app.v2_options import (
@@ -226,6 +227,18 @@ async def pdf_unlock_v2(
     content = await read_upload_bytes(file)
     result = await run_service(unlock_pdf, content, options.password)
     return file_response(result, "application/pdf", file.filename, "output.pdf")
+
+
+@router.post("/pdf-repair")
+async def pdf_repair_v2(
+    file: UploadedFile,
+    _key: ApiKeyDep,
+):
+    content = await read_upload_bytes(file)
+    out_bytes, repair_headers = await run_service(repair_pdf, content)
+    response = file_response(out_bytes, "application/pdf", file.filename, "reparado.pdf")
+    response.headers.update(repair_headers)
+    return response
 
 
 @router.post("/redact")

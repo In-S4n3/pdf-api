@@ -64,3 +64,23 @@ def test_decompression_bomb_is_contained(monkeypatch):
         repair_pdf(_b(REPAIR / "bomb.pdf"))
     assert e.value.status_code == 422
     assert e.value.code in {"repair_timeout", "repair_oom", "repair_too_large", "unrecoverable_pdf"}
+
+
+def test_endpoint_repairs_and_sets_headers(client):
+    resp = client.post(
+        "/v2/pdf-repair",
+        files={"file": ("broken.pdf", io.BytesIO((REPAIR / "broken_xref.pdf").read_bytes()), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["X-Repair-Status"] == "repaired"
+    assert resp.headers["X-Repair-Method"] == "pikepdf"
+    assert resp.content[:5] == b"%PDF-"
+
+
+def test_endpoint_encrypted_returns_400(client):
+    resp = client.post(
+        "/v2/pdf-repair",
+        files={"file": ("enc.pdf", io.BytesIO((FIX / "encrypted.pdf").read_bytes()), "application/pdf")},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "password_protected"
