@@ -1262,3 +1262,90 @@ def build_health_payload() -> dict[str, Any]:
             "libreoffice": read_version(["soffice", "--headless", "--version"], 30),
         },
     }
+
+
+# --- reparar-pdf -------------------------------------------------------------
+
+_REPAIR_UNRECOVERABLE = "Não foi possível reparar o PDF — está demasiado danificado."
+
+
+def _has_acroform(pdf) -> bool:
+    try:
+        return pdf.Root.get("/AcroForm") is not None
+    except Exception:
+        return False
+
+
+def _has_syntax_issues(content: bytes) -> bool:
+    """True if the INPUT already has detectable syntax problems (drives already-healthy)."""
+    import pikepdf
+
+    try:
+        pdf = pikepdf.open(io.BytesIO(content))
+    except pikepdf.PdfError:
+        return True
+    try:
+        return len(pdf.check_pdf_syntax()) > 0
+    finally:
+        pdf.close()
+
+
+def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
+    """Repair a corrupt PDF. Returns (output_bytes, X-Repair-* headers)."""
+    import pikepdf
+
+    # Pre-check A: magic bytes (LIVENESS, not a security boundary)
+    if b"%PDF-" not in content[:1024]:
+        raise ApiError(status_code=400, code="not_a_pdf",
+                       message="O ficheiro não é um PDF válido.")
+
+    # Tier 1: pikepdf structure repair (attempt_recovery=True is the default)
+    try:
+        pdf = pikepdf.open(io.BytesIO(content))
+    except pikepdf.PasswordError as exc:  # SIBLING of PdfError — own handler, FIRST
+        raise ApiError(status_code=400, code="password_protected",
+                       message="PDF protegido por palavra-passe. Use Desbloquear PDF primeiro.") from exc
+    except pikepdf.PdfError:
+        return _repair_with_ghostscript(content, baseline=None)  # open failed -> Tier 2
+
+    try:
+        try:
+            m = len(pdf.pages)  # pages recoverable AT OPEN TIME (post-recovery, not pristine)
+        except Exception:
+            return _repair_with_ghostscript(content, baseline=None)
+        buf = io.BytesIO()
+        pdf.save(buf)  # rebuild xref/trailer, non-incremental
+        out_bytes = buf.getvalue()
+    finally:
+        pdf.close()
+
+    # Verdict via pikepdf-native check_pdf_syntax() (empty list == clean)
+    input_dirty = _has_syntax_issues(content)
+    reopened = pikepdf.open(io.BytesIO(out_bytes))
+    try:
+        output_dirty = len(reopened.check_pdf_syntax()) > 0
+        n = len(reopened.pages)
+    finally:
+        reopened.close()
+
+    if output_dirty or n == 0:  # residual damage save() couldn't fix -> deeper repair
+        return _repair_with_ghostscript(content, baseline=m)
+
+    if n < m:
+        status = "partial"          # real page loss ONLY
+    elif not input_dirty:
+        status = "already-healthy"  # input was already clean
+    else:
+        status = "repaired"
+
+    headers = {
+        "X-Repair-Status": status,
+        "X-Repair-Method": "pikepdf",
+        "X-Repair-Pages": f"{n}/{m}",
+        "X-Repair-Warnings": "false",
+    }
+    return out_bytes, headers
+
+
+def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[bytes, dict[str, str]]:
+    raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
