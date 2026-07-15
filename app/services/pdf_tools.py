@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 import re as _re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -1347,5 +1349,86 @@ def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
     return out_bytes, headers
 
 
+GS_REPAIR_TIMEOUT = 40                       # seconds, under the shared 60s Cloud Run wall
+GS_REPAIR_MAX_BYTES = 30 * 1024 * 1024       # do not spend the gs budget on >30MB
+GS_REPAIR_MEM_BYTES = 1536 * 1024 * 1024     # 1.5 GiB rlimit, under the 2Gi container
+
+
+def _run_gs_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, str]:
+    """Run gs with a memory rlimit + own process group. Returns (result, stderr)."""
+    import resource
+
+    def _limit():  # runs in the child between fork and exec (gs is fork+exec; no py locks held)
+        os.setsid()
+        # ⚠ CONTROLLER FIX: setrlimit(RLIMIT_AS) raises on platforms that don't
+        # honor it (e.g. macOS dev: "current limit exceeds maximum limit"), which
+        # would crash the whole subprocess via preexec_fn. Best-effort it: Linux
+        # prod enforces the cap; dev degrades to timeout-only containment.
+        # ponytail: best-effort memory cap; the subprocess timeout is the backstop.
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        except (ValueError, OSError):
+            pass
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, preexec_fn=_limit,
+        )
+    except FileNotFoundError as exc:
+        raise ApiError(status_code=503, code="tool_unavailable",
+                       message="Ferramenta de reparação indisponível.") from exc
+    except subprocess.TimeoutExpired:
+        return "timeout", ""
+    if proc.returncode == 0:
+        return "ok", ""
+    stderr = (proc.stderr or b"").decode("utf-8", "replace")
+    if "VMerror" in stderr or "out of memory" in stderr.lower() or proc.returncode == -signal.SIGKILL:
+        return "oom", stderr
+    return "failed", stderr
+
+
 def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[bytes, dict[str, str]]:
-    raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+    import pikepdf
+
+    if len(content) > GS_REPAIR_MAX_BYTES:
+        raise ApiError(status_code=422, code="repair_too_large",
+                       message="O PDF é demasiado grande para reparação profunda.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.pdf")
+        out_path = os.path.join(tmp, "out.pdf")
+        with open(in_path, "wb") as fh:
+            fh.write(content)
+        cmd = [
+            "gs", "-q", "-dSAFER", "-dNOPAUSE", "-dBATCH",
+            "-dDetectDuplicateImages=false",
+            "-sDEVICE=pdfwrite", "-o", out_path, in_path,
+        ]
+        result, _stderr = _run_gs_guarded(cmd, timeout=GS_REPAIR_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
+        if result == "timeout":
+            raise ApiError(status_code=422, code="repair_timeout",
+                           message="O PDF é demasiado complexo para reparar no tempo disponível.")
+        if result == "oom":
+            raise ApiError(status_code=422, code="repair_oom",
+                           message="O PDF é demasiado grande ou complexo para reparar.")
+        if result != "ok" or not os.path.exists(out_path):
+            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+        out_bytes = Path(out_path).read_bytes()
+
+    try:
+        reopened = pikepdf.open(io.BytesIO(out_bytes))
+    except pikepdf.PdfError as exc:
+        raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE) from exc
+    try:
+        k = len(reopened.pages)  # re-derived from the gs OUTPUT, not the input object
+    finally:
+        reopened.close()
+    if k == 0:
+        raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+
+    return out_bytes, {
+        "X-Repair-Status": "reinterpreted-lossy",
+        "X-Repair-Method": "ghostscript",
+        "X-Repair-Pages": str(k),
+        "X-Repair-Warnings": "true",
+    }
