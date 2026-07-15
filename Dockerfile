@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Fail the build if the installed Ghostscript is older than the bookworm-security floor that
+# fixes CVE-2024-29510 (deb12u4) and the pdfwrite CVE-2025-59798 (deb12u8). Do NOT gate on
+# `gs --version` — bookworm ships upstream 10.00.0 and backports fixes without bumping it.
+RUN dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ghostscript)" ge 10.0.0~dfsg-11+deb12u8 \
+    || (echo "Ghostscript below the CVE-patched bookworm-security floor" && exit 1)
+
 # Set working directory
 WORKDIR /app
 
