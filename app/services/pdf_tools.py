@@ -1302,8 +1302,12 @@ def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
         if result != "ok" or not os.path.exists(meta_path):
             logger.warning("repair worker failed (result=%s): %s", result, stderr[:2000])
             raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
-        with open(meta_path, encoding="utf-8") as fh:
-            meta = json.load(fh)
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("repair worker wrote unreadable meta: %s", exc)
+            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE) from exc
 
         outcome = meta.get("outcome")
         if outcome == "ok":
@@ -1351,7 +1355,7 @@ def _run_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, 
     if proc.returncode == 0:
         return "ok", ""
     stderr = (proc.stderr or b"").decode("utf-8", "replace")
-    if "VMerror" in stderr or "out of memory" in stderr.lower() or proc.returncode == -signal.SIGKILL:
+    if "VMerror" in stderr or "out of memory" in stderr.lower() or "MemoryError" in stderr or proc.returncode == -signal.SIGKILL:
         return "oom", stderr
     return "failed", stderr
 
