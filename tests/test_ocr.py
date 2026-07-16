@@ -2,14 +2,15 @@
 
 import io
 import json
-import shutil
 
 import pytest
 
-OCRMYPDF_AVAILABLE = shutil.which("ocrmypdf") is not None
+from tests._env import can_ocr
+
+_NO_OCR = "requires full OCR toolchain (ocrmypdf + unpaper + tesseract pack; Docker-only)"
 
 
-@pytest.mark.skipif(not OCRMYPDF_AVAILABLE, reason="ocrmypdf CLI not installed")
+@pytest.mark.skipif(not can_ocr("eng"), reason=_NO_OCR)
 def test_ocr_returns_valid_pdf(client, sample_pdf):
     """OCR endpoint returns a valid PDF with default language (english)."""
     response = client.post(
@@ -21,7 +22,7 @@ def test_ocr_returns_valid_pdf(client, sample_pdf):
     assert response.content[:5] == b"%PDF-"
 
 
-@pytest.mark.skipif(not OCRMYPDF_AVAILABLE, reason="ocrmypdf CLI not installed")
+@pytest.mark.skipif(not can_ocr("por"), reason=_NO_OCR)
 def test_ocr_accepts_portuguese(client, sample_pdf):
     """OCR endpoint accepts portuguese language option."""
     response = client.post(
@@ -41,10 +42,11 @@ def test_ocr_rejects_invalid_language(client, sample_pdf):
         data={"options": json.dumps({"language": "klingon"})},
     )
     assert response.status_code == 400
-    assert "Unsupported language" in response.json()["error"]
+    # API speaks Portuguese: "Idioma não suportado: <lang>. Suportados: ..."
+    assert "não suportado" in response.json()["error"]
 
 
-@pytest.mark.skipif(not OCRMYPDF_AVAILABLE, reason="ocrmypdf CLI not installed")
+@pytest.mark.skipif(not can_ocr("eng"), reason=_NO_OCR)
 def test_ocr_preserves_filename(client, sample_pdf):
     """OCR endpoint includes original filename in Content-Disposition."""
     response = client.post(
@@ -62,7 +64,7 @@ def test_ocr_rejects_missing_file(client):
     assert response.status_code == 422
 
 
-@pytest.mark.skipif(not OCRMYPDF_AVAILABLE, reason="ocrmypdf CLI not installed")
+@pytest.mark.skipif(not can_ocr("jpn"), reason=_NO_OCR)
 def test_ocr_accepts_jpn(client, sample_pdf):
     """OCR endpoint accepts jpn language (validates passthrough in LANGUAGE_MAP)."""
     response = client.post(
