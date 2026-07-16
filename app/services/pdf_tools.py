@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
+import os
 import re as _re
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -1261,4 +1265,145 @@ def build_health_payload() -> dict[str, Any]:
             "tesseract": read_version(["tesseract", "--version"], 10, first_line=True),
             "libreoffice": read_version(["soffice", "--headless", "--version"], 30),
         },
+    }
+
+
+# --- reparar-pdf -------------------------------------------------------------
+
+_REPAIR_UNRECOVERABLE = "Não foi possível reparar o PDF — está demasiado danificado."
+
+
+def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
+    """Repair a corrupt PDF. Returns (output_bytes, X-Repair-* headers).
+
+    Tier-1 pikepdf work runs in a memory+time-bounded SUBPROCESS (app.services.
+    _repair_worker) so a decompression bomb expands in a killable child, never in
+    this API worker. On escalation the parent runs the (already sandboxed) gs Tier-2.
+    """
+    # Pre-check: magic bytes (liveness only — cheap, no decompression)
+    if b"%PDF-" not in content[:1024]:
+        raise ApiError(status_code=400, code="not_a_pdf",
+                       message="O ficheiro não é um PDF válido.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.pdf")
+        out_path = os.path.join(tmp, "out.pdf")
+        meta_path = os.path.join(tmp, "meta.json")
+        with open(in_path, "wb") as fh:
+            fh.write(content)
+        cmd = [sys.executable, "-m", "app.services._repair_worker", in_path, out_path, meta_path]
+        result, stderr = _run_guarded(cmd, timeout=REPAIR_WORKER_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
+        if result == "timeout":
+            raise ApiError(status_code=422, code="repair_timeout",
+                           message="O PDF é demasiado complexo para reparar no tempo disponível.")
+        if result == "oom":
+            raise ApiError(status_code=422, code="repair_oom",
+                           message="O PDF é demasiado grande ou complexo para reparar.")
+        if result != "ok" or not os.path.exists(meta_path):
+            logger.warning("repair worker failed (result=%s): %s", result, stderr[:2000])
+            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("repair worker wrote unreadable meta: %s", exc)
+            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE) from exc
+
+        outcome = meta.get("outcome")
+        if outcome == "ok":
+            out_bytes = Path(out_path).read_bytes()
+            return out_bytes, meta["headers"]
+        if outcome == "error":
+            raise ApiError(status_code=meta["status"], code=meta["code"], message=meta["message"])
+        # outcome == "escalate" — baseline captured; run Tier-2 outside the tempdir
+        baseline = meta.get("baseline")
+
+    return _repair_with_ghostscript(content, baseline)
+
+
+REPAIR_WORKER_TIMEOUT = 15   # Tier-1 pikepdf budget (bomb guard); + GS_REPAIR_TIMEOUT(40) < 60s Cloud Run wall
+GS_REPAIR_TIMEOUT = 40                       # seconds, under the shared 60s Cloud Run wall
+GS_REPAIR_MAX_BYTES = 30 * 1024 * 1024       # do not spend the gs budget on >30MB
+GS_REPAIR_MEM_BYTES = 1536 * 1024 * 1024     # 1.5 GiB rlimit, under the 2Gi container
+
+
+def _run_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, str]:
+    """Run gs with a memory rlimit + own process group. Returns (result, stderr)."""
+    import resource
+
+    def _limit():  # runs in the child between fork and exec (gs is fork+exec; no py locks held)
+        os.setsid()
+        # ⚠ CONTROLLER FIX: setrlimit(RLIMIT_AS) raises on platforms that don't
+        # honor it (e.g. macOS dev: "current limit exceeds maximum limit"), which
+        # would crash the whole subprocess via preexec_fn. Best-effort it: Linux
+        # prod enforces the cap; dev degrades to timeout-only containment.
+        # ponytail: best-effort memory cap; the subprocess timeout is the backstop.
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        except (ValueError, OSError):
+            pass
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, preexec_fn=_limit,
+        )
+    except FileNotFoundError as exc:
+        raise ApiError(status_code=503, code="tool_unavailable",
+                       message="Ferramenta de reparação indisponível.") from exc
+    except subprocess.TimeoutExpired:
+        return "timeout", ""
+    if proc.returncode == 0:
+        return "ok", ""
+    stderr = (proc.stderr or b"").decode("utf-8", "replace")
+    if "VMerror" in stderr or "out of memory" in stderr.lower() or "MemoryError" in stderr or proc.returncode == -signal.SIGKILL:
+        return "oom", stderr
+    return "failed", stderr
+
+
+def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[bytes, dict[str, str]]:
+    import pikepdf
+
+    if len(content) > GS_REPAIR_MAX_BYTES:
+        raise ApiError(status_code=422, code="repair_too_large",
+                       message="O PDF é demasiado grande para reparação profunda.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.pdf")
+        out_path = os.path.join(tmp, "out.pdf")
+        with open(in_path, "wb") as fh:
+            fh.write(content)
+        cmd = [
+            "gs", "-q", "-dSAFER", "-dNOPAUSE", "-dBATCH",
+            "-dDetectDuplicateImages=false",
+            "-sDEVICE=pdfwrite", "-o", out_path, in_path,
+        ]
+        result, stderr = _run_guarded(cmd, timeout=GS_REPAIR_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
+        if result == "timeout":
+            raise ApiError(status_code=422, code="repair_timeout",
+                           message="O PDF é demasiado complexo para reparar no tempo disponível.")
+        if result == "oom":
+            raise ApiError(status_code=422, code="repair_oom",
+                           message="O PDF é demasiado grande ou complexo para reparar.")
+        if result != "ok" or not os.path.exists(out_path):
+            logger.warning("ghostscript repair failed (result=%s): %s", result, stderr[:2000])
+            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+        out_bytes = Path(out_path).read_bytes()
+
+    try:
+        reopened = pikepdf.open(io.BytesIO(out_bytes))
+    except pikepdf.PdfError as exc:
+        raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE) from exc
+    try:
+        k = len(reopened.pages)  # re-derived from the gs OUTPUT, not the input object
+    finally:
+        reopened.close()
+    if k == 0:
+        raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE)
+
+    pages_header = f"{k}/{baseline}" if baseline is not None else str(k)
+    return out_bytes, {
+        "X-Repair-Status": "reinterpreted-lossy",
+        "X-Repair-Method": "ghostscript",
+        "X-Repair-Pages": pages_header,
+        "X-Repair-Warnings": "true",
     }
