@@ -94,7 +94,9 @@ def test_v2_pdf_to_word_text_returns_200(client):
     assert response.headers["content-type"] == (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
-    assert response.headers["content-disposition"].endswith('.docx"')
+    # Name the parameter, not the tail of the string: RFC 6266 Appendix D
+    # puts the ASCII `filename` first, so `filename*` is what ends the value.
+    assert 'filename="test.docx"' in response.headers["content-disposition"]
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
         assert "word/document.xml" in zf.namelist()
 

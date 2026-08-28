@@ -157,7 +157,9 @@ def test_v2_pdf_to_excel_happy_returns_200(client):
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == XLSX_MIME
-    assert response.headers["content-disposition"].endswith('.xlsx"')
+    # Name the parameter, not the tail of the string: RFC 6266 Appendix D
+    # puts the ASCII `filename` first, so `filename*` is what ends the value.
+    assert 'filename="test.xlsx"' in response.headers["content-disposition"]
     wb = load_workbook(io.BytesIO(response.content))
     assert wb.worksheets[0]["A1"].value == "Produto"
 
