@@ -36,3 +36,32 @@ def test_echo_strict_mode_rejects_unconfigured_api_key(client, monkeypatch, samp
     )
     assert response.status_code == 503
     assert response.json()["error"] == "API key is not configured"
+
+
+def test_production_rejects_unconfigured_api_key_by_default(client, monkeypatch, sample_pdf):
+    """Production must fail closed even when STRICT_API_KEY is omitted."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("STRICT_API_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+
+    response = client.post(
+        "/v2/echo",
+        files={"file": ("test.pdf", io.BytesIO(sample_pdf), "application/pdf")},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "http_error"
+
+
+def test_development_allows_unconfigured_api_key(client, monkeypatch, sample_pdf):
+    """Local development keeps the convenient unauthenticated default."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("STRICT_API_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "development")
+
+    response = client.post(
+        "/v2/echo",
+        files={"file": ("test.pdf", io.BytesIO(sample_pdf), "application/pdf")},
+    )
+
+    assert response.status_code == 200

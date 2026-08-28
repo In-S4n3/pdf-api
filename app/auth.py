@@ -25,7 +25,8 @@ async def verify_api_key(
 
     Returns the validated key on success.
     Raises 401 if missing or invalid.
-    When API_KEY is empty (local dev), allows all requests.
+    When API_KEY is empty in development, allows all requests. Production and
+    explicit strict mode fail closed.
     """
     settings = get_settings()
     configured_api_key = settings.api_key

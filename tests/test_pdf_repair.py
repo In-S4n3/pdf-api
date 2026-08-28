@@ -1,12 +1,14 @@
 # tests/test_pdf_repair.py
 import io
+import time
+import zlib
 from pathlib import Path
 
 import pytest
 
+import app.services.pdf_tools as pdf_tools  # for monkeypatching repair timeouts
 from app.api_errors import ApiError
 from app.services.pdf_tools import repair_pdf
-import app.services.pdf_tools as pdf_tools  # for monkeypatching GS_REPAIR_TIMEOUT
 
 REPAIR = Path(__file__).parent / "fixtures" / "repair"
 FIX = Path(__file__).parent / "fixtures"
@@ -64,9 +66,6 @@ def test_decompression_bomb_is_contained(monkeypatch):
     assert e.value.code in {"repair_timeout", "repair_oom", "repair_too_large", "unrecoverable_pdf"}
 
 
-import time, zlib
-
-
 def _big_bomb(decoded_mb: int) -> bytes:
     huge = b"0 0 m\n" * (decoded_mb * 1024 * 1024 // 6)
     comp = zlib.compress(huge)
@@ -96,7 +95,13 @@ def test_big_bomb_is_contained_in_subprocess_fast(monkeypatch):
 def test_endpoint_repairs_and_sets_headers(client):
     resp = client.post(
         "/v2/pdf-repair",
-        files={"file": ("broken.pdf", io.BytesIO((REPAIR / "broken_xref.pdf").read_bytes()), "application/pdf")},
+        files={
+            "file": (
+                "broken.pdf",
+                io.BytesIO((REPAIR / "broken_xref.pdf").read_bytes()),
+                "application/pdf",
+            )
+        },
     )
     assert resp.status_code == 200
     assert resp.headers["X-Repair-Status"] == "repaired"
@@ -107,7 +112,13 @@ def test_endpoint_repairs_and_sets_headers(client):
 def test_endpoint_encrypted_returns_400(client):
     resp = client.post(
         "/v2/pdf-repair",
-        files={"file": ("enc.pdf", io.BytesIO((FIX / "encrypted.pdf").read_bytes()), "application/pdf")},
+        files={
+            "file": (
+                "enc.pdf",
+                io.BytesIO((FIX / "encrypted.pdf").read_bytes()),
+                "application/pdf",
+            )
+        },
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "password_protected"

@@ -13,6 +13,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,7 +27,9 @@ from app.api_errors import ApiError
 
 logger = logging.getLogger(__name__)
 
-MAX_PAGES = 200  # coarse guard; the 55s subprocess timeout is the real runtime bound
+MAX_PAGES = 200  # coarse guard; the 45s subprocess timeout is the real runtime bound
+TOOL_SUBPROCESS_TIMEOUT = 45
+REDACTION_SCAN_TIMEOUT_SECONDS = 40
 
 # pdf_to_xlsx caps (in-process; see 2026-07-02-pdf-para-excel-design.md §3.2).
 MAX_TABLES = 200  # cap total worksheets
@@ -161,24 +166,40 @@ def _compile_pattern(
     return PATTERNS[strategy], 0
 
 
-def _extract_matches(
+def _iter_matches(
     doc, *, strategy: str, custom_text: str, regex_pattern: str
-) -> list[RedactionMatch]:
-    """Find all matches across all pages. Used by both /preview and /redact."""
+) -> Iterator[RedactionMatch]:
+    """Yield bounded redaction matches for both preview and apply."""
     if doc.needs_pass:
         raise ApiError(
             400, "password_protected_pdf",
             "Este PDF está protegido por palavra-passe. Remova a proteção antes de redactar.",
         )
+    if doc.page_count > MAX_PAGES:
+        raise ApiError(
+            422,
+            "too_many_pages",
+            f"O PDF tem demasiadas páginas para redacção (máximo: {MAX_PAGES}).",
+        )
+
     pattern_str, flags = _compile_pattern(strategy, custom_text, regex_pattern)
-    matches: list[RedactionMatch] = []
+    compiled_pattern = regex.compile(pattern_str, flags)
+    deadline = time.monotonic() + REDACTION_SCAN_TIMEOUT_SECONDS
 
     for page_idx, page in enumerate(doc):
-        text = page.get_text("text")
-        try:
-            iter_matches = list(
-                regex.finditer(pattern_str, text, flags=flags, timeout=REGEX_TIMEOUT_SECONDS)
+        if time.monotonic() >= deadline:
+            raise ApiError(
+                504,
+                "processing_timeout",
+                "A pesquisa de dados sensíveis excedeu o tempo limite.",
             )
+        text = page.get_text("text")
+        full_match_strings: set[str] = set()
+        try:
+            for regex_match in compiled_pattern.finditer(
+                text, timeout=REGEX_TIMEOUT_SECONDS
+            ):
+                full_match_strings.add(regex_match.group())
         except regex.error as exc:
             raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
         except TimeoutError as exc:
@@ -187,22 +208,44 @@ def _extract_matches(
                 "O padrão regex é demasiado complexo (possível ReDoS). Simplifique-o.",
             ) from exc
 
-        full_match_strings = {m.group() for m in iter_matches}
-
         for match_str in full_match_strings:
+            if time.monotonic() >= deadline:
+                raise ApiError(
+                    504,
+                    "processing_timeout",
+                    "A pesquisa de dados sensíveis excedeu o tempo limite.",
+                )
             for rect in page.search_for(match_str):
                 # Decompose the match rect into per-word bboxes for clean preview highlights.
                 words = page.get_text("words", clip=rect)
                 if not words:
                     bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
-                    matches.append(_make_match(strategy, page_idx, bbox, match_str, match_str))
+                    yield _make_match(strategy, page_idx, bbox, match_str, match_str)
                     continue
                 for w in words:
+                    if time.monotonic() >= deadline:
+                        raise ApiError(
+                            504,
+                            "processing_timeout",
+                            "A pesquisa de dados sensíveis excedeu o tempo limite.",
+                        )
                     bbox = (w[0], w[1], w[2], w[3])
                     word_text = w[4]
-                    matches.append(_make_match(strategy, page_idx, bbox, word_text, match_str))
+                    yield _make_match(strategy, page_idx, bbox, word_text, match_str)
 
-    return matches
+
+def _extract_matches(
+    doc, *, strategy: str, custom_text: str, regex_pattern: str
+) -> list[RedactionMatch]:
+    """Collect matches for apply; preview streams into its bounded payload."""
+    return list(
+        _iter_matches(
+            doc,
+            strategy=strategy,
+            custom_text=custom_text,
+            regex_pattern=regex_pattern,
+        )
+    )
 
 
 def _trim_process_output(value: str, limit: int = 500) -> str:
@@ -262,7 +305,10 @@ def compress_pdf(content: bytes) -> bytes:
             raise ApiError(
                 status_code=400,
                 code="password_protected_pdf",
-                message="Este PDF está protegido por palavra-passe. Remova a proteção antes de comprimir.",
+                message=(
+                    "Este PDF está protegido por palavra-passe. "
+                    "Remova a proteção antes de comprimir."
+                ),
             )
         doc.rewrite_images(
             dpi_threshold=150,
@@ -299,7 +345,10 @@ def flatten_pdf(content: bytes) -> bytes:
             raise ApiError(
                 status_code=400,
                 code="password_protected_pdf",
-                message="Este PDF está protegido por palavra-passe. Remova a proteção antes de achatar.",
+                message=(
+                    "Este PDF está protegido por palavra-passe. "
+                    "Remova a proteção antes de achatar."
+                ),
             )
         doc.bake(annots=True, widgets=True)
         return doc.tobytes(garbage=4, deflate=True)
@@ -336,7 +385,7 @@ def _convert_office(content: bytes, content_type: str) -> bytes:
                 f"-env:UserInstallation=file://{tmpdir}/profile",
                 str(input_path),
             ],
-            timeout=55,
+            timeout=TOOL_SUBPROCESS_TIMEOUT,
             missing_message="LibreOffice não está disponível neste ambiente.",
         )
 
@@ -371,7 +420,7 @@ def _convert_image_with_libreoffice(content: bytes, content_type: str) -> bytes:
                 f"-env:UserInstallation=file://{tmpdir}/profile",
                 str(input_path),
             ],
-            timeout=55,
+            timeout=TOOL_SUBPROCESS_TIMEOUT,
             missing_message="LibreOffice não está disponível neste ambiente.",
         )
 
@@ -575,7 +624,7 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 str(input_path),
                 str(output_path),
             ],
-            timeout=55,
+            timeout=TOOL_SUBPROCESS_TIMEOUT,
             missing_message="OCRmyPDF não está disponível neste ambiente.",
         )
 
@@ -654,7 +703,7 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
                 str(pdfa_definition_path),
                 str(input_path),
             ],
-            timeout=55,
+            timeout=TOOL_SUBPROCESS_TIMEOUT,
             missing_message="Ghostscript não está disponível neste ambiente.",
         )
 
@@ -1046,7 +1095,10 @@ def pdf_to_docx(content: bytes) -> bytes:
                 raise ApiError(
                     status_code=400,
                     code="password_protected_pdf",
-                    message="Este PDF está protegido por palavra-passe. Desbloqueie-o antes de converter.",
+                    message=(
+                        "Este PDF está protegido por palavra-passe. "
+                        "Desbloqueie-o antes de converter."
+                    ),
                 )
             if doc.page_count > MAX_PAGES:
                 raise ApiError(
@@ -1069,7 +1121,7 @@ def pdf_to_docx(content: bytes) -> bytes:
 
         result = _run_command(
             ["pdf2docx", "convert", str(input_path), str(output_path)],
-            timeout=55,
+            timeout=TOOL_SUBPROCESS_TIMEOUT,
             missing_message="Conversor indisponível neste ambiente.",
         )
         if result.returncode != 0 or not output_path.exists():
@@ -1292,7 +1344,11 @@ def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
         with open(in_path, "wb") as fh:
             fh.write(content)
         cmd = [sys.executable, "-m", "app.services._repair_worker", in_path, out_path, meta_path]
-        result, stderr = _run_guarded(cmd, timeout=REPAIR_WORKER_TIMEOUT, mem_bytes=GS_REPAIR_MEM_BYTES)
+        result, stderr = _run_guarded(
+            cmd,
+            timeout=REPAIR_WORKER_TIMEOUT,
+            mem_bytes=GS_REPAIR_MEM_BYTES,
+        )
         if result == "timeout":
             raise ApiError(status_code=422, code="repair_timeout",
                            message="O PDF é demasiado complexo para reparar no tempo disponível.")
@@ -1307,7 +1363,11 @@ def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
                 meta = json.load(fh)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("repair worker wrote unreadable meta: %s", exc)
-            raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE) from exc
+            raise ApiError(
+                status_code=422,
+                code="unrecoverable_pdf",
+                message=_REPAIR_UNRECOVERABLE,
+            ) from exc
 
         outcome = meta.get("outcome")
         if outcome == "ok":
@@ -1321,8 +1381,8 @@ def repair_pdf(content: bytes) -> tuple[bytes, dict[str, str]]:
     return _repair_with_ghostscript(content, baseline)
 
 
-REPAIR_WORKER_TIMEOUT = 15   # Tier-1 pikepdf budget (bomb guard); + GS_REPAIR_TIMEOUT(40) < 60s Cloud Run wall
-GS_REPAIR_TIMEOUT = 40                       # seconds, under the shared 60s Cloud Run wall
+REPAIR_WORKER_TIMEOUT = 12  # Tier-1 bomb guard; total repair budget remains below the proxy.
+GS_REPAIR_TIMEOUT = 30  # Tier-2; 12 + 30 leaves transport/serialization headroom.
 GS_REPAIR_MAX_BYTES = 30 * 1024 * 1024       # do not spend the gs budget on >30MB
 GS_REPAIR_MEM_BYTES = 1536 * 1024 * 1024     # 1.5 GiB rlimit, under the 2Gi container
 
@@ -1338,10 +1398,8 @@ def _run_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, 
         # would crash the whole subprocess via preexec_fn. Best-effort it: Linux
         # prod enforces the cap; dev degrades to timeout-only containment.
         # ponytail: best-effort memory cap; the subprocess timeout is the backstop.
-        try:
+        with suppress(ValueError, OSError):
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, OSError):
-            pass
 
     try:
         proc = subprocess.run(
@@ -1355,7 +1413,13 @@ def _run_guarded(cmd: list[str], *, timeout: int, mem_bytes: int) -> tuple[str, 
     if proc.returncode == 0:
         return "ok", ""
     stderr = (proc.stderr or b"").decode("utf-8", "replace")
-    if "VMerror" in stderr or "out of memory" in stderr.lower() or "MemoryError" in stderr or proc.returncode == -signal.SIGKILL:
+    out_of_memory = (
+        "VMerror" in stderr
+        or "out of memory" in stderr.lower()
+        or "MemoryError" in stderr
+        or proc.returncode == -signal.SIGKILL
+    )
+    if out_of_memory:
         return "oom", stderr
     return "failed", stderr
 
@@ -1392,7 +1456,11 @@ def _repair_with_ghostscript(content: bytes, baseline: int | None) -> tuple[byte
     try:
         reopened = pikepdf.open(io.BytesIO(out_bytes))
     except pikepdf.PdfError as exc:
-        raise ApiError(status_code=422, code="unrecoverable_pdf", message=_REPAIR_UNRECOVERABLE) from exc
+        raise ApiError(
+            status_code=422,
+            code="unrecoverable_pdf",
+            message=_REPAIR_UNRECOVERABLE,
+        ) from exc
     try:
         k = len(reopened.pages)  # re-derived from the gs OUTPUT, not the input object
     finally:

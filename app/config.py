@@ -25,9 +25,10 @@ def _read_csv(name: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-# Matches the frontend FE limit (50 MB) so a missing/misconfigured env var
-# never leaves the API accepting arbitrarily large uploads (DoS surface).
-DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# Matches TudoPDF's server-tool ceiling. Keeping the backend at the same lower
+# bound means direct callers cannot bypass the browser/proxy guard and spend the
+# Cloud Run request budget on files the product itself refuses.
+DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 # Production CORS allowlist used when CORS_ALLOWED_ORIGINS is unset. Keeps a
 # misconfigured deploy from silently denying every browser request.
@@ -50,11 +51,14 @@ class Settings:
 def get_settings() -> Settings:
     environment = os.environ.get("ENVIRONMENT", "production").strip().lower() or "production"
     api_key = os.environ.get("API_KEY", "").strip()
+    # Production is always fail-closed. STRICT_API_KEY remains useful for
+    # exercising the same posture in development, but cannot disable it in prod.
+    strict_api_key = environment == "production" or _read_bool("STRICT_API_KEY", default=False)
     return Settings(
         environment=environment,
         api_key=api_key,
         debug=environment == "development",
-        strict_api_key=_read_bool("STRICT_API_KEY", default=False),
+        strict_api_key=strict_api_key,
         max_upload_bytes=_read_optional_int("MAX_UPLOAD_BYTES") or DEFAULT_MAX_UPLOAD_BYTES,
         cors_allowed_origins=_read_csv("CORS_ALLOWED_ORIGINS") or DEFAULT_CORS_ORIGINS,
     )

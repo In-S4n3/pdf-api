@@ -1,5 +1,9 @@
 # Migracao do Frontend para a PDF API v2
 
+> **Deprecacao:** `/v2/fill-form` permanece compativel e sem data de remocao,
+> mas o TudoPDF ja processa esta ferramenta no browser. As respostas do endpoint
+> incluem os headers `Deprecation` e `Link`.
+
 ## Objetivo
 
 Migrar o frontend das rotas atuais para a `v2` sem quebrar uploads, downloads nem a experiencia atual do utilizador.

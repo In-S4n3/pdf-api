@@ -14,7 +14,7 @@ The API will be available at `http://localhost:8000`.
 
 - Health check: `GET /health`
 - V2 health check: `GET /v2/health`
-- API docs: `GET /docs`
+- API docs in development: `GET /docs`
 - Echo test: `POST /echo` (multipart file upload)
 - V2 tools: `POST /v2/<tool>`
 
@@ -43,6 +43,10 @@ The new HTTP contract lives under `/v2/*`.
   - `X-Request-ID` on every response
 
 Frontend migration notes live in `docs/frontend-v2-migration.md`.
+
+`POST /v2/fill-form` is deprecated because TudoPDF now fills forms entirely in
+the browser. It remains available without a removal date and sends the standard
+`Deprecation` and `Link` response headers so consumers can migrate safely.
 
 ## License
 

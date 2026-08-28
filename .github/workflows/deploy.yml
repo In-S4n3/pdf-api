@@ -13,7 +13,23 @@ env:
   GAR_LOCATION: europe-west1
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build test image
+        run: docker build --build-arg INSTALL_DEV=true -t pdf-api:test .
+
+      - name: Lint
+        run: docker run --rm pdf-api:test ruff check app tests
+
+      - name: Test full system toolchain
+        run: docker run --rm pdf-api:test pytest -q
+
   deploy:
+    needs: quality
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,6 +67,25 @@ jobs:
           service: "${{ env.SERVICE }}"
           region: "${{ env.REGION }}"
           image: "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }}"
+          timeout: 60s
+          env_vars: |-
+            ENVIRONMENT=production
+            STRICT_API_KEY=true
+            MAX_UPLOAD_BYTES=20971520
+          env_vars_update_strategy: merge
+          flags: >-
+            --memory=2Gi
+            --cpu=2
+            --concurrency=1
 
       - name: Output service URL
         run: echo "Service URL ${{ steps.deploy.outputs.url }}"
+
+      - name: Smoke test health and fail-closed auth
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.url }}"
+          curl --fail --silent --show-error --retry 5 --retry-delay 2 "$SERVICE_URL/v2/health" >/dev/null
+          STATUS="$(curl --silent --show-error --output /tmp/pdf-api-auth.json --write-out '%{http_code}' \
+            --request POST "$SERVICE_URL/v2/echo" \
+            --form 'file=@tests/fixtures/sample.pdf;type=application/pdf')"
+          test "$STATUS" = "401"

@@ -46,7 +46,12 @@ def file_response(content: bytes, media_type: str, filename: str | None, default
     )
 
 
-def parse_options_json(raw_options: str) -> dict[str, Any]:
+def parse_options_json(
+    raw_options: str,
+    *,
+    invalid_json_message: str = "Options must be valid JSON.",
+    invalid_object_message: str = "Options payload must be a JSON object.",
+) -> dict[str, Any]:
     """Parse an options JSON string into a dictionary."""
     try:
         parsed = json.loads(raw_options or "{}")
@@ -54,14 +59,14 @@ def parse_options_json(raw_options: str) -> dict[str, Any]:
         raise ApiError(
             status_code=400,
             code="invalid_options",
-            message="Options must be valid JSON.",
+            message=invalid_json_message,
         ) from exc
 
     if not isinstance(parsed, dict):
         raise ApiError(
             status_code=400,
             code="invalid_options",
-            message="Options payload must be a JSON object.",
+            message=invalid_object_message,
         )
 
     return parsed
@@ -95,13 +100,15 @@ async def read_upload_bytes(file: UploadFile, *, legacy: bool = False) -> bytes:
             break
         total += len(chunk)
         if total > max_bytes:
+            message = (
+                f"Uploaded file exceeds the configured limit of {max_bytes} bytes."
+                if legacy
+                else f"O ficheiro excede o limite configurado de {max_bytes} bytes."
+            )
             error = ApiError(
                 status_code=413,
                 code="file_too_large",
-                message=(
-                    f"Uploaded file exceeds the configured limit of "
-                    f"{max_bytes} bytes."
-                ),
+                message=message,
             )
             if legacy:
                 raise HTTPException(status_code=error.status_code, detail=error.message) from error

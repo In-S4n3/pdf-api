@@ -16,9 +16,9 @@ def client():
     return TestClient(app)
 
 
-def test_default_max_upload_bytes_is_50_mib():
+def test_default_max_upload_bytes_matches_tudopdf_20_mib_ceiling():
     settings = get_settings()
-    assert settings.max_upload_bytes == DEFAULT_MAX_UPLOAD_BYTES == 50 * 1024 * 1024
+    assert settings.max_upload_bytes == DEFAULT_MAX_UPLOAD_BYTES == 20 * 1024 * 1024
 
 
 def test_oversized_upload_returns_413(client, monkeypatch):

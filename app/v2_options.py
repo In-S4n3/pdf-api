@@ -128,7 +128,11 @@ def options_dependency[OptionsModel: StrictOptionsModel](
     """Create a FastAPI dependency that validates the JSON options payload."""
 
     async def dependency(options: Annotated[str, Form()] = "{}") -> OptionsModel:
-        raw_options = parse_options_json(options)
+        raw_options = parse_options_json(
+            options,
+            invalid_json_message="As opções têm de ser JSON válido.",
+            invalid_object_message="As opções têm de ser um objeto JSON.",
+        )
         try:
             return model_type.model_validate(raw_options)
         except ValidationError as exc:
@@ -138,7 +142,7 @@ def options_dependency[OptionsModel: StrictOptionsModel](
             raise ApiError(
                 status_code=422,
                 code="invalid_options",
-                message="Options validation failed.",
+                message="As opções não passaram a validação.",
                 details=exc.errors(include_context=False),
             ) from exc
 

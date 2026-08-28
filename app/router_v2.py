@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 
 from app.api_errors import ApiError
 from app.auth import verify_api_key
 from app.http_utils import file_response, filename_stem, read_upload_bytes, run_service
 from app.services.pdf_tools import (
-    _extract_matches,
+    _iter_matches,
     build_health_payload,
     compress_pdf,
     convert_pdf_to_pdfa,
@@ -42,6 +43,7 @@ from app.v2_options import (
 )
 
 router = APIRouter(prefix="/v2")
+logger = logging.getLogger(__name__)
 ApiKeyDep = Annotated[str, Depends(verify_api_key)]
 UploadedFile = Annotated[UploadFile, File(...)]
 EmptyOptionsDep = Annotated[EmptyOptions, options_dependency(EmptyOptions)]
@@ -149,12 +151,17 @@ async def flatten_v2(
     return file_response(result, "application/pdf", file.filename, "output.pdf")
 
 
-@router.post("/fill-form")
+@router.post("/fill-form", deprecated=True)
 async def fill_form_v2(
     file: UploadedFile,
     options: FillFormOptionsDep,
     _key: ApiKeyDep,
+    request: Request,
 ):
+    logger.warning(
+        "Deprecated /v2/fill-form called (request_id=%s)",
+        getattr(request.state, "request_id", "unknown"),
+    )
     content = await read_upload_bytes(file)
     result = await run_service(
         fill_form_pdf,
@@ -260,8 +267,13 @@ async def redact_v2(
 
 
 def _extract_matches_json(
-    content: bytes, *, strategy: str, custom_text: str, regex_pattern: str
-) -> list[dict[str, object]]:
+    content: bytes,
+    *,
+    strategy: str,
+    custom_text: str,
+    regex_pattern: str,
+    match_cap: int,
+) -> dict[str, object]:
     """Open the PDF, extract matches via the shared helper, serialise to JSON-ready dicts.
 
     Lives in the route module (not pdf_tools) because it is purely a transport
@@ -279,25 +291,29 @@ def _extract_matches_json(
         ) from exc
 
     try:
-        # _extract_matches raises 400 password_protected_pdf / invalid_regex_pattern
-        # / regex_too_slow as ApiError — middleware turns those into the v2 envelope.
-        matches = _extract_matches(
-            doc,
-            strategy=strategy,
-            custom_text=custom_text,
-            regex_pattern=regex_pattern,
-        )
-        return [
-            {
-                "id": m.id,
-                "page": m.page,
-                "bbox": list(m.bbox),
-                "kind": m.kind,
-                "context": m.context,
-                "fullMatch": m.full_match,
-            }
-            for m in matches
-        ]
+        # _iter_matches raises password/regex/page/time errors as ApiError;
+        # middleware turns those into the v2 envelope.
+        matches_json: list[dict[str, object]] = []
+        total = 0
+        for match in _iter_matches(
+            doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern
+        ):
+            total += 1
+            if len(matches_json) >= match_cap:
+                continue
+            matches_json.append({
+                "id": match.id,
+                "page": match.page,
+                "bbox": list(match.bbox),
+                "kind": match.kind,
+                "context": match.context,
+                "fullMatch": match.full_match,
+            })
+        return {
+            "matches": matches_json,
+            "total": total,
+            "truncated": total > match_cap,
+        }
     finally:
         doc.close()
 
@@ -311,17 +327,12 @@ async def redact_preview_v2(
     """Dry-run: return matches as JSON so the UI can render bbox overlays
     before the user confirms which IDs to apply via POST /v2/redact."""
     content = await read_upload_bytes(file)
-    matches_json = await run_service(
+    result = await run_service(
         _extract_matches_json,
         content,
         strategy=options.strategy.value,
         custom_text=options.customText,
         regex_pattern=options.regexPattern,
+        match_cap=_PREVIEW_MATCH_CAP,
     )
-
-    truncated = len(matches_json) > _PREVIEW_MATCH_CAP
-    return {
-        "matches": matches_json[:_PREVIEW_MATCH_CAP],
-        "total": len(matches_json),
-        "truncated": truncated,
-    }
+    return result

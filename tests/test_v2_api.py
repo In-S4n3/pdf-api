@@ -50,6 +50,7 @@ def test_v2_invalid_options_returns_structured_error(client, sample_pdf):
     assert response.status_code == 400
     body = response.json()
     assert body["error"]["code"] == "invalid_options"
+    assert body["error"]["message"] == "As opções têm de ser JSON válido."
     assert body["error"]["requestId"] == response.headers["x-request-id"]
 
 
@@ -59,7 +60,36 @@ def test_v2_missing_file_returns_structured_validation_error(client):
     assert response.status_code == 422
     body = response.json()
     assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["message"] == "O pedido não passou a validação."
     assert isinstance(body["error"]["details"], list)
+
+
+def test_v2_post_route_set_matches_the_frontend_contract(client):
+    """Guard endpoint renames that would break TudoPDF's consumer map."""
+    expected = {
+        "/v2/compress",
+        "/v2/convert",
+        "/v2/echo",
+        "/v2/fill-form",
+        "/v2/flatten",
+        "/v2/ocr",
+        "/v2/pdf-repair",
+        "/v2/pdf-to-excel",
+        "/v2/pdf-to-image",
+        "/v2/pdf-to-word",
+        "/v2/pdf-unlock",
+        "/v2/pdfa",
+        "/v2/protect",
+        "/v2/redact",
+        "/v2/redact/preview",
+    }
+    actual = {
+        route.path
+        for route in client.app.routes
+        if route.path.startswith("/v2/") and "POST" in (route.methods or set())
+    }
+
+    assert actual == expected
 
 
 def test_v2_pdf_to_image_invalid_pdf_returns_structured_error(client):

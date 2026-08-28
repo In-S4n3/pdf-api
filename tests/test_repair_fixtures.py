@@ -3,7 +3,6 @@ import io
 from pathlib import Path
 
 import pikepdf
-import pytest
 
 REPAIR = Path(__file__).parent / "fixtures" / "repair"
 

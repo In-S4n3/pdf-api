@@ -19,6 +19,12 @@ from app.router import router
 
 logger = logging.getLogger(__name__)
 
+FILL_FORM_DEPRECATED_AT = "@1787875200"  # 2026-08-28T00:00:00Z, RFC 9745 date.
+FILL_FORM_DEPRECATION_LINK = (
+    '<https://github.com/In-S4n3/pdf-api/blob/main/docs/frontend-v2-migration.md>; '
+    'rel="deprecation"'
+)
+
 
 def _is_v2_request(request: Request) -> bool:
     return request.url.path.startswith("/v2/")
@@ -46,7 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Startup and shutdown lifecycle."""
     settings = get_settings()
     if settings.environment == "production" and not settings.api_key:
-        logger.warning("API_KEY is not configured; requests are currently unauthenticated.")
+        logger.error("API_KEY is not configured; protected routes will fail closed.")
     yield
 
 
@@ -69,6 +75,9 @@ async def request_id_middleware(request: Request, call_next):
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
+    if request.url.path == "/v2/fill-form":
+        response.headers["Deprecation"] = FILL_FORM_DEPRECATED_AT
+        response.headers["Link"] = FILL_FORM_DEPRECATION_LINK
     return response
 
 
@@ -132,7 +141,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             content=_v2_error_content(
                 request,
                 code="invalid_request",
-                message="Request validation failed.",
+                message="O pedido não passou a validação.",
                 details=exc.errors(),
             ),
         )

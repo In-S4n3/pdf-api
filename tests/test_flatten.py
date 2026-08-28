@@ -106,7 +106,13 @@ def test_flatten_rejects_encrypted_pdf(client):
     """Encrypted PDFs return 400 with a Portuguese message (v1 envelope)."""
     response = client.post(
         "/flatten",
-        files={"file": ("encrypted.pdf", io.BytesIO(ENCRYPTED_PDF.read_bytes()), "application/pdf")},
+        files={
+            "file": (
+                "encrypted.pdf",
+                io.BytesIO(ENCRYPTED_PDF.read_bytes()),
+                "application/pdf",
+            )
+        },
     )
     assert response.status_code == 400
     assert "palavra-passe" in response.json()["error"]
@@ -116,7 +122,13 @@ def test_v2_flatten_rejects_encrypted_pdf(client):
     """Encrypted PDFs return 400 + password_protected_pdf code (v2 envelope)."""
     response = client.post(
         "/v2/flatten",
-        files={"file": ("encrypted.pdf", io.BytesIO(ENCRYPTED_PDF.read_bytes()), "application/pdf")},
+        files={
+            "file": (
+                "encrypted.pdf",
+                io.BytesIO(ENCRYPTED_PDF.read_bytes()),
+                "application/pdf",
+            )
+        },
         data={"options": "{}"},
         headers={"X-API-Key": "test-key"},
     )

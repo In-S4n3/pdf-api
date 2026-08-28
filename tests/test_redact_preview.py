@@ -1,8 +1,10 @@
 """POST /v2/redact/preview returns JSON match list (no PDF body)."""
 
 import io
+import json
 from pathlib import Path
 
+import pymupdf
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -143,3 +145,36 @@ def test_apply_missing_custom_text_returns_422_not_500():
     )
     assert r.status_code == 422, r.text
     assert r.json()["error"]["code"] == "invalid_options"
+
+
+def test_preview_rejects_a_pdf_above_the_shared_page_limit():
+    """Bound preview CPU before a pathological document monopolises the worker."""
+    doc = pymupdf.open()
+    for _ in range(201):
+        doc.new_page()
+    content = doc.tobytes()
+    doc.close()
+
+    r = client.post(
+        "/v2/redact/preview",
+        files={"file": ("many-pages.pdf", io.BytesIO(content), "application/pdf")},
+        data={"options": json.dumps({"strategy": "email"})},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "too_many_pages"
+
+
+def test_fill_form_is_deprecated_without_removing_the_endpoint(sample_pdf):
+    """Deprecation remains non-destructive during the announced sunset window."""
+    r = client.post(
+        "/v2/fill-form",
+        files={"file": ("plain.pdf", io.BytesIO(sample_pdf), "application/pdf")},
+        data={"options": json.dumps({"fields": {"Name": "Tiago"}})},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert r.headers["deprecation"] == "@1787875200"
+    assert "sunset" not in r.headers
+    assert "rel=\"deprecation\"" in r.headers["link"]
