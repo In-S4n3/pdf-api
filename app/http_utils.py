@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Callable
 from functools import partial
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import HTTPException, UploadFile
 from fastapi.responses import Response
@@ -19,8 +21,15 @@ from app.config import get_settings
 
 def sanitize_filename(filename: str | None, default: str) -> str:
     """Return a safe attachment filename."""
-    candidate = Path(filename or default).name or default
-    cleaned = candidate.replace('"', "").replace("\r", "").replace("\n", "")
+    # Browsers may send Windows paths, and HTTP headers cannot contain control
+    # characters. Normalise separators before taking the basename and strip
+    # anything that could break a quoted Content-Disposition value.
+    candidate = Path((filename or default).replace("\\", "/")).name or default
+    cleaned = "".join(
+        character
+        for character in candidate.replace('"', "")
+        if ord(character) >= 32 and ord(character) != 127
+    )
     return cleaned or default
 
 
@@ -32,9 +41,22 @@ def filename_stem(filename: str | None, default: str = "output") -> str:
 
 
 def attachment_headers(filename: str | None, default: str) -> dict[str, str]:
-    """Build a safe attachment header."""
+    """Build an ASCII-safe header with an RFC 5987 UTF-8 filename."""
     safe_name = sanitize_filename(filename, default)
-    return {"Content-Disposition": f'attachment; filename="{safe_name}"'}
+    ascii_name = (
+        unicodedata.normalize("NFKD", safe_name)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    if not ascii_name.strip(" ."):
+        ascii_name = sanitize_filename(default, "output.pdf")
+    encoded_name = quote(safe_name, safe="!#$&+-.^_`|~")
+    return {
+        "Content-Disposition": (
+            f"attachment; filename*=UTF-8''{encoded_name}; "
+            f'filename="{ascii_name}"'
+        )
+    }
 
 
 def file_response(content: bytes, media_type: str, filename: str | None, default: str) -> Response:

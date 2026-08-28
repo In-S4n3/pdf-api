@@ -73,7 +73,27 @@ app = FastAPI(
 async def request_id_middleware(request: Request, call_next):
     """Attach a request id to every response for easier debugging."""
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "Unhandled request failure (request_id=%s)",
+            request.state.request_id,
+        )
+        if _is_v2_request(request):
+            response = JSONResponse(
+                status_code=500,
+                content=_v2_error_content(
+                    request,
+                    code="internal_error",
+                    message="Erro interno do servidor.",
+                ),
+            )
+        else:
+            response = JSONResponse(
+                status_code=500,
+                content={"error": "Erro interno do servidor."},
+            )
     response.headers["X-Request-ID"] = request.state.request_id
     if request.url.path == "/v2/fill-form":
         response.headers["Deprecation"] = FILL_FORM_DEPRECATED_AT

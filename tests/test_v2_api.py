@@ -6,6 +6,8 @@ import json
 import pymupdf
 from PIL import Image
 
+import app.router_v2 as router_v2
+
 
 def _make_pdf_with_text_field(field_name: str) -> bytes:
     """Create a PDF with a single text field for v2 form tests."""
@@ -62,6 +64,55 @@ def test_v2_missing_file_returns_structured_validation_error(client):
     assert body["error"]["code"] == "invalid_request"
     assert body["error"]["message"] == "O pedido não passou a validação."
     assert isinstance(body["error"]["details"], list)
+
+
+def test_v2_pdfa_returns_unicode_filename_without_header_failure(
+    client, monkeypatch, sample_pdf
+):
+    """A successful conversion must not become a 500 for decomposed accents."""
+    monkeypatch.setattr(router_v2, "convert_pdf_to_pdfa", lambda content, _: content)
+
+    response = client.post(
+        "/v2/pdfa",
+        files={
+            "file": (
+                "relato\u0303rio-conversac\u0327a\u0303o.pdf",
+                io.BytesIO(sample_pdf),
+                "application/pdf",
+            )
+        },
+        data={"options": json.dumps({"conformance": "pdfa-2b"})},
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert 'filename="relatorio-conversacao.pdf"' in disposition
+    assert "filename*=UTF-8''" in disposition
+
+
+def test_v2_unhandled_error_keeps_safe_envelope_and_request_id(
+    client, monkeypatch, sample_pdf
+):
+    def fail_conversion(_content, _conformance):
+        raise RuntimeError("sensitive internal failure")
+
+    monkeypatch.setattr(router_v2, "convert_pdf_to_pdfa", fail_conversion)
+
+    response = client.post(
+        "/v2/pdfa",
+        files={"file": ("sample.pdf", io.BytesIO(sample_pdf), "application/pdf")},
+        data={"options": json.dumps({"conformance": "pdfa-2b"})},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Erro interno do servidor.",
+            "details": None,
+            "requestId": response.headers["x-request-id"],
+        }
+    }
 
 
 def test_v2_post_route_set_matches_the_frontend_contract(client):
