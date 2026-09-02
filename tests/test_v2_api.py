@@ -143,6 +143,22 @@ def test_v2_post_route_set_matches_the_frontend_contract(client):
     assert actual == expected
 
 
+def test_v2_unknown_route_keeps_the_envelope_and_request_id(client):
+    """The router raises Starlette's HTTPException for an unmatched path; a
+    handler registered on FastAPI's subclass let it out as `{"detail": ...}`.
+    TudoPDF reads `error.code` to decide what the user sees, so the shape
+    must hold for every status pdf-api can answer with."""
+    response = client.post("/v2/nope")
+    assert response.status_code == 404
+    body = response.json()["error"]
+    assert body["code"] == "http_error"
+    assert body["requestId"] == response.headers["x-request-id"]
+
+    legacy = client.post("/nope")
+    assert legacy.status_code == 404
+    assert legacy.json() == {"error": "Not Found"}
+
+
 def test_v2_pdf_to_image_invalid_pdf_returns_structured_error(client):
     """Invalid PDF input should be reported consistently in v2."""
     response = client.post(

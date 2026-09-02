@@ -8,10 +8,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api_errors import ApiError
 from app.config import DEBUG, get_settings
@@ -131,8 +132,12 @@ async def api_error_handler(request: Request, exc: ApiError):
     )
 
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
+# Registered on Starlette's class, not FastAPI's subclass: the router raises the
+# base class for an unmatched path or method, and a handler on the subclass let
+# those out as Starlette's own `{"detail": "Not Found"}` — outside the v2
+# envelope and without the request id.
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """Return JSON error per D-07."""
     if _is_v2_request(request):
         message = exc.detail if isinstance(exc.detail, str) else "HTTP request failed."
@@ -168,5 +173,5 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     return JSONResponse(
         status_code=422,
-        content={"error": "Dados invalidos na requisicao"},
+        content={"error": "Dados inválidos na requisição"},
     )
