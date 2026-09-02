@@ -34,6 +34,14 @@ Substituir:
 - `/redact` por `/v2/redact`
 - `/health` por `/v2/health`
 
+Rotas que so existem na `v2` (sem equivalente `v1`):
+
+- `/v2/pdf-unlock`
+- `/v2/pdf-to-word`
+- `/v2/pdf-to-excel`
+- `/v2/pdf-repair`
+- `/v2/redact/preview`
+
 ### 2. Atualizar o parser de erros
 
 Na `v1`, os erros eram assim:
@@ -114,7 +122,7 @@ Mas agora a `v2` valida o JSON de forma estrita. Isto significa:
 
 Exemplos:
 
-- `pdf-to-image` aceita apenas `{"format":"png"}` ou `{"format":"jpeg"}`
+- `pdf-to-image` aceita apenas `format` (`png`/`jpeg`) e `pages` (`first`/`all`)
 - `ocr` aceita apenas linguas suportadas
 - `pdfa` aceita apenas conformidades suportadas
 - `fill-form` exige `fields`
@@ -259,14 +267,15 @@ Enviar por exemplo:
 
 ```json
 {
-  "format": "png"
+  "format": "png",
+  "pages": "first"
 }
 ```
 
 Valores aceites:
 
-- `png`
-- `jpeg`
+- `format`: `png` ou `jpeg`
+- `pages`: `first` (uma imagem) ou `all` (ZIP, maximo 20 paginas)
 
 ### `protect`
 
