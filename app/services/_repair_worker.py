@@ -9,7 +9,7 @@ so a decompression bomb expands HERE — in a killable child — and never OOMs 
 main worker. Writes a JSON envelope to <meta_path>:
     {"outcome": "ok", "headers": {..X-Repair-*..}}    # + repaired PDF bytes to <out_path>
     {"outcome": "escalate", "baseline": <int|null>}   # caller runs Ghostscript Tier-2
-    {"outcome": "error", "status": 400, "code": "password_protected", "message": "..."}
+    {"outcome": "error", "status": 400, "code": "password_protected_pdf", "message": "..."}
 If the child is killed (bomb) it writes no/partial meta -> the parent maps the kill.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def _classify(content: bytes) -> tuple[dict, bytes | None]:
     try:
         pdf = pikepdf.open(io.BytesIO(content))
     except pikepdf.PasswordError:  # SIBLING of PdfError — own handler, FIRST
-        return {"outcome": "error", "status": 400, "code": "password_protected",
+        return {"outcome": "error", "status": 400, "code": "password_protected_pdf",
                 "message": _PW_MESSAGE}, None
     except pikepdf.PdfError:
         return {"outcome": "escalate", "baseline": None}, None  # open failed -> Tier 2

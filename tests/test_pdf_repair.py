@@ -42,7 +42,7 @@ def test_encrypted_pdf_steers_to_unlock():
     with pytest.raises(ApiError) as e:
         repair_pdf(_b(FIX / "encrypted.pdf"))
     assert e.value.status_code == 400
-    assert e.value.code == "password_protected"
+    assert e.value.code == "password_protected_pdf"
 
 
 def test_truncated_escalates_to_ghostscript():
@@ -121,4 +121,4 @@ def test_endpoint_encrypted_returns_400(client):
         },
     )
     assert resp.status_code == 400
-    assert resp.json()["error"]["code"] == "password_protected"
+    assert resp.json()["error"]["code"] == "password_protected_pdf"
