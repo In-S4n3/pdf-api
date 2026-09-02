@@ -139,6 +139,9 @@ async def api_error_handler(request: Request, exc: ApiError):
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """Return JSON error per D-07."""
+    # Starlette's 405 carries `Allow`; the default handler forwarded it and
+    # this one must too.
+    headers = getattr(exc, "headers", None)
     if _is_v2_request(request):
         message = exc.detail if isinstance(exc.detail, str) else "HTTP request failed."
         return JSONResponse(
@@ -149,11 +152,13 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
                 message=message,
                 details=exc.detail if not isinstance(exc.detail, str) else None,
             ),
+            headers=headers,
         )
 
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.detail},
+        headers=headers,
     )
 
 

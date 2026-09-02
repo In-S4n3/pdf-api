@@ -158,6 +158,14 @@ def test_v2_unknown_route_keeps_the_envelope_and_request_id(client):
     assert legacy.status_code == 404
     assert legacy.json() == {"error": "Not Found"}
 
+    # RFC 9110 §15.5.6: a 405 must say what is allowed. Starlette sets the
+    # header on the exception; a handler that rebuilds the response has to
+    # carry it over.
+    wrong_method = client.get("/v2/compress")
+    assert wrong_method.status_code == 405
+    assert "POST" in wrong_method.headers["allow"]
+    assert wrong_method.json()["error"]["code"] == "http_error"
+
 
 def test_v2_pdf_to_image_invalid_pdf_returns_structured_error(client):
     """Invalid PDF input should be reported consistently in v2."""
