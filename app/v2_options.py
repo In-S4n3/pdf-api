@@ -72,7 +72,12 @@ class PdfaOptions(StrictOptionsModel):
 
 
 class ProtectOptions(StrictOptionsModel):
-    userPassword: Annotated[str, Field(min_length=1)]
+    # Empty is refused by protect_pdf as 400 invalid_password ("A palavra-passe
+    # é obrigatória."). A min_length here would win first and hand the user the
+    # generic "não passaram a validação" envelope instead — TudoPDF renders the
+    # message verbatim whenever a code is present, so the message must be the
+    # one written for this case.
+    userPassword: str = ""
 
 
 class UnlockOptions(StrictOptionsModel):

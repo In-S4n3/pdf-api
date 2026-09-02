@@ -160,3 +160,17 @@ def test_protect_missing_file_returns_422(client):
         data={"options": json.dumps({"userPassword": "test"})},
     )
     assert response.status_code == 422
+
+
+def test_v2_protect_empty_password_names_the_missing_password(client):
+    """An empty password must reach protect_pdf's own message, not the generic
+    options envelope — the FE renders `message` verbatim when a code is present."""
+    response = client.post(
+        "/v2/protect",
+        files={"file": ("test.pdf", io.BytesIO(_make_plain_pdf()), "application/pdf")},
+        data={"options": json.dumps({"userPassword": ""})},
+    )
+    assert response.status_code == 400
+    body = response.json()["error"]
+    assert body["code"] == "invalid_password"
+    assert body["message"] == "A palavra-passe é obrigatória."
