@@ -58,6 +58,25 @@ def test_pdfa_preserves_filename(client, sample_pdf):
     assert "my-doc.pdf" in response.headers.get("content-disposition", "")
 
 
+@pytest.mark.skipif(not pdfa_resources_present(), reason=_NO_PDFA)
+def test_pdfa_failure_message_is_portuguese(monkeypatch, sample_pdf):
+    """TudoPDF renders a coded message verbatim, so it must not be English."""
+    import subprocess
+
+    from app.api_errors import ApiError
+    from app.services import pdf_tools
+
+    monkeypatch.setattr(
+        pdf_tools,
+        "_run_command",
+        lambda command, **_: subprocess.CompletedProcess(command, 1, "", "boom"),
+    )
+    with pytest.raises(ApiError) as exc:
+        pdf_tools.convert_pdf_to_pdfa(sample_pdf, "pdfa-2b")
+    assert exc.value.code == "pdfa_conversion_failed"
+    assert exc.value.message == "Falha na conversão para PDF/A."
+
+
 def test_pdfa_rejects_missing_file(client):
     """PDF/A endpoint returns 422 when no file is provided."""
     response = client.post("/pdfa")

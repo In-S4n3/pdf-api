@@ -227,7 +227,7 @@ def test_convert_rejects_unsupported_type(client):
         data={"options": "{}"},
     )
     assert response.status_code == 400
-    assert "Formato nao suportado" in response.json()["error"]
+    assert "Formato não suportado" in response.json()["error"]
 
 
 def test_convert_rejects_missing_file(client):

@@ -102,7 +102,7 @@ def test_invalid_pdf_returns_400_portuguese(client):
     )
     assert response.status_code == 400
     body = response.json()
-    assert "possivel" in body["error"].lower() or "valido" in body["error"].lower()
+    assert body["error"] == "Não foi possível abrir o PDF. Verifique se o ficheiro é válido."
 
 
 def test_missing_file_returns_422(client):

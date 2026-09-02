@@ -327,7 +327,7 @@ def compress_pdf(content: bytes) -> bytes:
         raise ApiError(
             status_code=400,
             code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
+            message="Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
         ) from exc
     finally:
         if doc is not None:
@@ -358,7 +358,7 @@ def flatten_pdf(content: bytes) -> bytes:
         raise ApiError(
             status_code=400,
             code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
+            message="Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
         ) from exc
     finally:
         if doc is not None:
@@ -393,7 +393,7 @@ def _convert_office(content: bytes, content_type: str) -> bytes:
             raise ApiError(
                 status_code=500,
                 code="conversion_failed",
-                message="Falha na conversao do documento.",
+                message="Falha na conversão do documento.",
                 details={"stderr": _trim_process_output(result.stderr)},
             )
 
@@ -428,7 +428,7 @@ def _convert_image_with_libreoffice(content: bytes, content_type: str) -> bytes:
             raise ApiError(
                 status_code=500,
                 code="conversion_failed",
-                message="Falha na conversao da imagem.",
+                message="Falha na conversão da imagem.",
                 details={"stderr": _trim_process_output(result.stderr)},
             )
 
@@ -473,7 +473,7 @@ def convert_to_pdf(content: bytes, content_type: str | None, filename: str | Non
         raise ApiError(
             status_code=400,
             code="unsupported_media_type",
-            message="Formato nao suportado.",
+            message="Formato não suportado.",
         )
 
     if resolved_content_type in OFFICE_MIMES:
@@ -496,7 +496,7 @@ def pdf_first_page_to_image(content: bytes, fmt: str) -> tuple[bytes, str, str]:
         raise ApiError(
             status_code=400,
             code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
+            message="Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
         ) from exc
 
     try:
@@ -504,7 +504,7 @@ def pdf_first_page_to_image(content: bytes, fmt: str) -> tuple[bytes, str, str]:
             raise ApiError(
                 status_code=400,
                 code="invalid_pdf",
-                message="O PDF nao contem paginas para converter.",
+                message="O PDF não contém páginas para converter.",
             )
 
         page = doc[0]
@@ -518,7 +518,7 @@ def pdf_first_page_to_image(content: bytes, fmt: str) -> tuple[bytes, str, str]:
         raise ApiError(
             status_code=500,
             code="conversion_failed",
-            message="Nao foi possivel converter este PDF para imagem.",
+            message="Não foi possível converter este PDF para imagem.",
         ) from exc
     finally:
         if doc is not None:
@@ -542,7 +542,7 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
         raise ApiError(
             status_code=400,
             code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
+            message="Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
         ) from exc
 
     try:
@@ -551,7 +551,7 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
             raise ApiError(
                 status_code=400,
                 code="invalid_pdf",
-                message="O PDF nao contem paginas para converter.",
+                message="O PDF não contém páginas para converter.",
             )
 
         if page_count > MAX_PAGES_FOR_IMAGES:
@@ -559,8 +559,8 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
                 status_code=400,
                 code="too_many_pages",
                 message=(
-                    f"O PDF tem {page_count} paginas (maximo: {MAX_PAGES_FOR_IMAGES}). "
-                    "Use a ferramenta Extrair Paginas para selecionar as paginas pretendidas."
+                    f"O PDF tem {page_count} páginas (máximo: {MAX_PAGES_FOR_IMAGES}). "
+                    "Use a ferramenta Extrair Páginas para selecionar as páginas pretendidas."
                 ),
             )
 
@@ -582,7 +582,7 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
         raise ApiError(
             status_code=500,
             code="conversion_failed",
-            message="Nao foi possivel converter este PDF para imagens.",
+            message="Não foi possível converter este PDF para imagens.",
         ) from exc
     finally:
         if doc is not None:
@@ -632,14 +632,14 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
             raise ApiError(
                 status_code=400,
                 code="invalid_pdf",
-                message="Ficheiro PDF invalido ou corrompido.",
+                message="Ficheiro PDF inválido ou corrompido.",
             )
 
         if result.returncode == 8:
             raise ApiError(
                 status_code=400,
                 code="password_protected_pdf",
-                message="PDF protegido por palavra-passe. Remova a protecao primeiro.",
+                message="PDF protegido por palavra-passe. Remova a proteção primeiro.",
             )
 
         if result.returncode != 0 or not output_path.exists():
@@ -714,9 +714,9 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
                 "password_protected_pdf" if status_code == 400 else "pdfa_conversion_failed"
             )
             message = (
-                "PDF protegido por palavra-passe. Remova a protecao primeiro."
+                "PDF protegido por palavra-passe. Remova a proteção primeiro."
                 if status_code == 400
-                else "PDF/A conversion failed."
+                else "Falha na conversão para PDF/A."
             )
             raise ApiError(
                 status_code=status_code,
@@ -737,13 +737,13 @@ def _open_pikepdf(content: bytes):
         raise ApiError(
             status_code=400,
             code="password_protected_pdf",
-            message="Este PDF ja esta protegido com palavra-passe.",
+            message="Este PDF já está protegido com palavra-passe.",
         ) from exc
     except Exception as exc:
         raise ApiError(
             status_code=400,
             code="invalid_pdf",
-            message="Nao foi possivel abrir o PDF. Verifique se o ficheiro e valido.",
+            message="Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
         ) from exc
 
 
