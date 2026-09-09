@@ -30,6 +30,15 @@ def _read_csv(name: str) -> tuple[str, ...]:
 # Cloud Run request budget on files the product itself refuses.
 DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
+# Vector paths a PDF may carry before `pdf_to_docx` refuses it. pdf2docx walks
+# every path hunting for table borders, so its cost tracks path count and not
+# pages or bytes — the curve is in `pdf_to_docx`. Tunable because the one
+# number the curve cannot supply is how much slower the 2-vCPU container is
+# than the machine it was measured on: raise or lower it with
+# `gcloud run services update pdf-api --update-env-vars MAX_VECTOR_ITEMS=...`
+# once a real file has been timed in production.
+DEFAULT_MAX_VECTOR_ITEMS = 30_000
+
 # Production CORS allowlist used when CORS_ALLOWED_ORIGINS is unset. Keeps a
 # misconfigured deploy from silently denying every browser request.
 DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
@@ -45,6 +54,7 @@ class Settings:
     debug: bool
     strict_api_key: bool
     max_upload_bytes: int
+    max_vector_items: int
     cors_allowed_origins: tuple[str, ...]
 
 
@@ -60,6 +70,7 @@ def get_settings() -> Settings:
         debug=environment == "development",
         strict_api_key=strict_api_key,
         max_upload_bytes=_read_optional_int("MAX_UPLOAD_BYTES") or DEFAULT_MAX_UPLOAD_BYTES,
+        max_vector_items=_read_optional_int("MAX_VECTOR_ITEMS") or DEFAULT_MAX_VECTOR_ITEMS,
         cors_allowed_origins=_read_csv("CORS_ALLOWED_ORIGINS") or DEFAULT_CORS_ORIGINS,
     )
 

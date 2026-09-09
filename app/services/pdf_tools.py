@@ -24,6 +24,7 @@ import img2pdf
 import regex
 
 from app.api_errors import ApiError
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1114,6 +1115,35 @@ def pdf_to_docx(content: bytes) -> bytes:
                     message=(
                         "Este PDF parece digitalizado (sem texto selecionável). "
                         "Use a ferramenta OCR primeiro e depois converta."
+                    ),
+                )
+            # pdf2docx inspects every vector path hunting for table borders, so
+            # its cost tracks path count — not pages, not bytes. Measured on
+            # 10-page files against the 45s subprocess budget:
+            #
+            #   vector items |  2 010 | 15 010 | 30 010 | 40 010 | 50 010
+            #   convert time |  0.6 s |  2.5 s | 10.0 s | 19.4 s | 30.7 s
+            #
+            # Superlinear, and on hardware faster than the 2-vCPU container.
+            # A larger file of 180 plain-text pages carries zero paths and
+            # converts in 7.8 s, which is why this counts paths and not size.
+            #
+            # This is the shape behind four 504s on 2026-08-13: one 1.4 MB PDF,
+            # four retries in five minutes, every one dying at ~55 s. Counting
+            # costs 0.03 s, so saying no quickly is nearly free.
+            vector_items = sum(
+                len(drawing.get("items", ()))
+                for page in doc
+                for drawing in page.get_cdrawings()
+            )
+            if vector_items > get_settings().max_vector_items:
+                raise ApiError(
+                    status_code=422,
+                    code="too_complex_pdf",
+                    message=(
+                        "Este PDF tem demasiados elementos gráficos para converter "
+                        "para Word dentro do tempo limite. Divida-o primeiro com a "
+                        "ferramenta Dividir PDF e converta cada parte."
                     ),
                 )
         finally:
