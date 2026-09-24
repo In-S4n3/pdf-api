@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re as _re
 import signal
@@ -17,6 +18,7 @@ import time
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +128,21 @@ LANGUAGE_MAP = {
 # -j 2 OCRs pages in pairs, so keep the cap even.
 OCR_FLAGS = ("--output-type", "pdf", "--optimize", "0", "--jobs", "2", "--rotate-pages")
 MAX_OCR_PAGES = 8
+# The pages cap alone let 6 photo pages with captions take 31 s on that box
+# (≈55 s on amd64): OCRmyPDF renders any page with text or a vector drawing —
+# a scanner's footer is enough — at 400 dpi, and the time goes into writing
+# those pixels as PNG, twice per page. So the pixels it will render are
+# budgeted too, colour counting twice (_ocr_megapixels): 8 colour A4 scans at
+# 300 dpi weigh 139 (16 s). One page runs on one core, so it gets half.
+# Heaviest accepted on the box, 2026-09-24: 8 A4 photo pages at 300 dpi, 21 s.
+MAX_OCR_MEGAPIXELS = 150
+# Hand Tesseract at most ~A4 at 300 dpi; the 400 dpi renders above it only
+# cost time (31 → 25 s on those photo pages). Scans up to 300 dpi are untouched.
+OCR_DOWNSAMPLE_FLAGS = (
+    "--tesseract-downsample-large-images",
+    "--tesseract-downsample-above",
+    "3600",
+)
 
 CONFORMANCE_MAP = {
     "pdfa-1b": "1",
@@ -593,9 +610,11 @@ def _images_to_rgb(doc) -> None:
 def compress_pdf(content: bytes) -> bytes:
     """Compress a PDF using PyMuPDF.
 
-    Images above 150 dpi are downsampled to 96 dpi and re-encoded as JPEG q75
-    (lossy); 1-bit scans are left alone. Owner restrictions are kept. A result
-    that is not smaller is refused (422 compress_no_gain) rather than sold.
+    Every colour or grey image is re-encoded as JPEG q75 (lossy), and those
+    above 150 dpi are also subsampled by a power of two that keeps them at
+    96 dpi or more (300→150, 400→100; MuPDF never lands on 96 itself); 1-bit
+    scans are left alone. Owner restrictions are kept. A result that is not
+    smaller is refused (422 compress_no_gain) rather than sold.
     """
     doc = _open_pdf(content)
     try:
@@ -853,7 +872,7 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
                 code="too_many_pages",
                 message=(
                     f"O PDF tem {page_count} páginas (máximo: {MAX_PAGES_FOR_IMAGES}). "
-                    "Use a ferramenta Extrair Páginas para selecionar as páginas pretendidas."
+                    "Use a ferramenta Extrair PDF para selecionar as páginas pretendidas."
                 ),
             )
         _check_image_budget(doc)
@@ -862,8 +881,9 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
         digits = len(str(page_count))  # pagina-02 sorts before pagina-10
         deadline = time.monotonic() + PROCESSING_BUDGET_SECONDS
         buf = io.BytesIO()
-        # Stored, not deflated: PNG and JPEG are compressed already.
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        # Deflated, level 1: a document page is mostly white, and stored ZIPs of
+        # its JPGs came out 37-175% bigger. Level 1 costs little on 20 pages.
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
             for i, page in enumerate(doc):
                 _check_deadline(deadline)
                 zf.writestr(f"pagina-{i + 1:0{digits}d}.{ext}", _render_page(page, fmt))
@@ -877,7 +897,7 @@ def pdf_to_images(content: bytes, fmt: str) -> tuple[bytes, str, str]:
                             "Escolha o formato JPG, que ocupa menos, ou converta menos páginas."
                             if fmt != "jpeg"
                             else "Converta menos páginas de cada vez com a ferramenta "
-                            "Extrair Páginas."
+                            "Extrair PDF."
                         ),
                     )
 
@@ -910,6 +930,35 @@ def _pages_needing_ocr(doc) -> list[int]:
         if visible < 30 or covered / area >= 0.5:
             pages.append(pno)
     return pages
+
+
+def _ocr_megapixels(page) -> float:
+    """Megapixels OCRmyPDF will render for this page, colour counted twice.
+
+    Mirrors ocrmypdf 17 (_pipeline.get_page_square_dpi, rasterize): the page
+    renders at its images' highest resolution, at 400 dpi or more when it has
+    any text (invisible too) or vector painting, and in colour when an image is
+    colour or anything is painted. test_ocr_megapixels_match_what_ocrmypdf_renders
+    pins it against the PNG OCRmyPDF writes.
+    """
+    dpis = []
+    for info in page.get_image_info():
+        a, b, c, d = info["transform"][:4]
+        shown_w, shown_h = math.hypot(a, b) / 72, math.hypot(c, d) / 72
+        if info["width"] and info["height"] and shown_w and shown_h:
+            dpis.append(max(info["width"] / shown_w, info["height"] / shown_h))
+    has_vector = bool(page.get_cdrawings())  # annotations count too: errs heavy
+    dpi = max(dpis, default=0)
+    if not dpis or has_vector or page.get_texttrace():
+        dpi = max(dpi, 400)
+    # By the PDF's own colour space, as OCRmyPDF reads it: a grey scan with an
+    # ICC profile is rendered in colour.
+    colour = has_vector or any(
+        bpc > 1 and cs not in ("DeviceGray", "CalGray", "Indexed")
+        for _, _, _, _, bpc, cs, *_ in page.get_images(full=True)
+    )
+    inches = page.mediabox.width * page.mediabox.height / 72**2
+    return inches * dpi**2 / 1e6 * (2 if colour else 1)
 
 
 def ocr_pdf(content: bytes, language: str) -> bytes:
@@ -951,14 +1000,32 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 422,
                 "too_many_pages",
                 f"Este PDF tem {len(pages)} páginas para reconhecer e o OCR processa até "
-                f"{MAX_OCR_PAGES} de cada vez. Divida-o com a ferramenta Dividir PDF "
-                "e processe cada parte.",
+                f"{MAX_OCR_PAGES} de cada vez. Separe-as com a ferramenta Extrair PDF, "
+                f"até {MAX_OCR_PAGES} páginas de cada vez, e processe cada parte.",
             )
         if any(abs(doc[pno - 1].rect) * (300 / 72) ** 2 > MAX_RENDER_PIXELS for pno in pages):
             raise ApiError(
                 422,
                 "page_too_large",
                 "Este PDF tem páginas demasiado grandes para OCR (o máximo é A2).",
+            )
+        megapixels = [_ocr_megapixels(doc[pno - 1]) for pno in pages]
+        if max(megapixels) > MAX_OCR_MEGAPIXELS / 2:
+            raise ApiError(
+                422,
+                "page_too_large",
+                "Este PDF tem páginas demasiado grandes ou com resolução demasiado alta "
+                "para OCR.",
+            )
+        if sum(megapixels) > MAX_OCR_MEGAPIXELS:
+            fit = sum(1 for total in accumulate(megapixels) if total <= MAX_OCR_MEGAPIXELS)
+            raise ApiError(
+                422,
+                "too_many_pages",
+                f"Este PDF tem {len(pages)} páginas para reconhecer, a cores ou em alta "
+                f"resolução, e o OCR processa até {fit} páginas assim de cada vez. "
+                f"Separe-as com a ferramenta Extrair PDF, até {fit} de cada vez, e "
+                "processe cada parte.",
             )
         _check_image_budget(doc, pages=[pno - 1 for pno in pages])
         all_pages = len(pages) == doc.page_count
@@ -978,6 +1045,7 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 "ocrmypdf",
                 mode,
                 *OCR_FLAGS,
+                *OCR_DOWNSAMPLE_FLAGS,
                 "-l",
                 lang_code,
                 *([] if all_pages else ["--pages", ",".join(map(str, pages))]),
@@ -1478,6 +1546,38 @@ def fill_form_pdf(
         pdf.close()
 
 
+def _image_box(page, item) -> tuple[float, ...] | None:
+    try:
+        return tuple(round(v, 1) for v in page.get_image_bbox(item))
+    except Exception:  # drawn through a form XObject, or not drawn at all
+        return None
+
+
+def _jpeg_image_boxes(page) -> set[tuple[float, ...]]:
+    """Where the page draws a JPEG, recorded before a redaction rewrites it."""
+    boxes = {_image_box(page, i) for i in page.get_images(full=True) if i[8] == "DCTDecode"}
+    boxes.discard(None)
+    return boxes
+
+
+def _store_redacted_jpegs_as_jpeg(page, jpeg_boxes: set[tuple[float, ...]]) -> None:
+    """Blanking pixels makes MuPDF rewrite the image unfiltered, and the save
+    stores it lossless: a photo page came back up to 8x the input, past what
+    Cloud Run delivers. A JPEG before stays a JPEG after. Gray and RGB only —
+    a CMYK JPEG's inversion is not portable across readers; it stays lossless.
+    """
+    doc = page.parent
+    for item in page.get_images(full=True):
+        xref, image_filter = item[0], item[8]
+        if image_filter or _image_box(page, item) not in jpeg_boxes:
+            continue
+        pix = pymupdf.Pixmap(doc, xref)
+        if pix.alpha or pix.n not in (1, 3):
+            continue
+        doc.update_stream(xref, pix.tobytes("jpeg", jpg_quality=88), compress=False)
+        doc.xref_set_key(xref, "Filter", "/DCTDecode")
+
+
 def redact_pdf(
     content: bytes,
     *,
@@ -1528,11 +1628,14 @@ def redact_pdf(
 
                     for page_idx in pages_with_redactions:
                         _check_deadline(deadline)
-                        doc[page_idx].apply_redactions(
+                        page = doc[page_idx]
+                        jpeg_boxes = _jpeg_image_boxes(page)
+                        page.apply_redactions(
                             images=pymupdf.PDF_REDACT_IMAGE_PIXELS,  # blank what the box covers
                             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                             text=pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
                         )
+                        _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
                 finally:
                     pymupdf.TOOLS.set_small_glyph_heights(False)
 
@@ -1565,7 +1668,16 @@ def redact_pdf(
         # — this is the exact EU AstraZeneca 2021 failure mode.
         doc.set_toc([])
 
-        return doc.tobytes(garbage=4, deflate=True, clean=True)
+        output = doc.tobytes(garbage=4, deflate=True, clean=True)
+        if len(output) > MAX_RESPONSE_BYTES:
+            raise ApiError(
+                422,
+                "output_too_large",
+                "O PDF censurado ficaria com mais de 30 MB, o máximo que conseguimos "
+                "entregar. Comprima primeiro o PDF com a ferramenta Comprimir PDF e "
+                "censure o resultado.",
+            )
+        return output
     except ApiError:
         raise
     except Exception as exc:
@@ -1889,11 +2001,14 @@ def pdf_to_xlsx(content: bytes) -> bytes:
             # PDF yields zero tables and lands here anyway.
             total_chars = sum(len("".join(p.get_text().split())) for p in doc)
             if total_chars < doc.page_count * 10:
+                # Tables are found from drawn lines: an OCR text layer adds none,
+                # so «OCR first» sold a paid step that could not help.
                 raise ApiError(
                     422,
                     "scanned_pdf",
-                    "Não foi possível extrair texto deste PDF. "
-                    "Se for digitalizado, use a ferramenta OCR primeiro.",
+                    "Não foi possível extrair texto deste PDF. A conversão para Excel só "
+                    "encontra tabelas em PDFs criados digitalmente; num PDF digitalizado "
+                    "não as encontra, nem depois do OCR.",
                 )
             raise ApiError(
                 422,

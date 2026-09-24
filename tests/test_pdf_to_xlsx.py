@@ -61,6 +61,10 @@ def test_scanned_pdf_raises_422():
         pdf_to_xlsx(g.blank_pdf())
     assert exc.value.status_code == 422
     assert exc.value.code == "scanned_pdf"
+    # CMS-R1-2 / CMS-R3: tables are found from drawn lines; an OCR text layer
+    # adds none, so «use a ferramenta OCR primeiro» sold a paid OCR that could
+    # not help.
+    assert "OCR primeiro" not in exc.value.message
 
 
 def test_encrypted_pdf_raises_400():

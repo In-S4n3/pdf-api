@@ -8,7 +8,7 @@ import pytest
 
 import app.services.pdf_tools as pdf_tools  # for monkeypatching repair timeouts
 from app.api_errors import ApiError
-from app.services.pdf_tools import repair_pdf
+from app.services.pdf_tools import PASSWORD_PROTECTED_MESSAGE, repair_pdf
 
 REPAIR = Path(__file__).parent / "fixtures" / "repair"
 FIX = Path(__file__).parent / "fixtures"
@@ -43,6 +43,8 @@ def test_encrypted_pdf_steers_to_unlock():
         repair_pdf(_b(FIX / "encrypted.pdf"))
     assert e.value.status_code == 400
     assert e.value.code == "password_protected_pdf"
+    # ENGINE-22 (P3): the same sentence the other nine tools use.
+    assert e.value.message == PASSWORD_PROTECTED_MESSAGE
 
 
 def test_truncated_escalates_to_ghostscript():

@@ -20,7 +20,12 @@ import sys
 
 import pikepdf
 
-_PW_MESSAGE = "PDF protegido por palavra-passe. Use Desbloquear PDF primeiro."
+# pdf_tools.PASSWORD_PROTECTED_MESSAGE, copied: this child imports pikepdf only
+# (it runs under a memory cap). test_encrypted_pdf_steers_to_unlock keeps them equal.
+_PW_MESSAGE = (
+    "Este PDF está protegido por palavra-passe. "
+    "Desbloqueie-o primeiro com a ferramenta Desbloquear PDF."
+)
 
 
 def _has_syntax_issues(content: bytes) -> bool:

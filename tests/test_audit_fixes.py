@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -118,6 +119,58 @@ def test_redact_blanks_the_scan_pixels_under_the_box(client):
         )
     assert dark == 0
     assert "ana.costa@exemplo.pt" not in _all_text(out.content)
+
+
+def _photo_scan(line: str) -> bytes:
+    """A colour photo of a page, stored as JPEG like a phone scan, with an
+    invisible OCR layer over the text."""
+    with pymupdf.open() as src:
+        page = src.new_page(width=595, height=842)
+        for i in range(1500):  # a busy background: lossless storage balloons
+            x, y = (i * 37) % 595, (i * 53) % 842
+            fill = ((i % 7) / 6, (i % 5) / 4, (i % 3) / 2)
+            page.draw_circle((x, y), 4 + i % 17, color=None, fill=fill)
+        page.insert_text((72, 90), line, fontsize=14)
+        jpeg = page.get_pixmap(dpi=150).tobytes("jpeg", jpg_quality=75)
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(page.rect, stream=jpeg)
+    page.insert_text((72, 90), line, fontsize=14, render_mode=3)
+    return doc.tobytes()
+
+
+def test_redact_keeps_a_jpeg_scan_a_jpeg(client):
+    """ENGINE R1 (P1): blanking the pixels under the box rewrote every JPEG it
+    touched as a lossless image — outputs up to 8x the input, past the 32 MiB
+    Cloud Run can deliver."""
+    pdf = _photo_scan("Contacto: ana.costa@exemplo.pt")
+    preview = _post(client, "redact/preview", pdf, {"strategy": "email"}).json()
+    box = pymupdf.Rect(preview["matches"][0]["bbox"]) + (1, 1, -1, -1)  # inside, not the row above
+
+    out = _post(client, "redact", pdf, {"strategy": "email"})
+    assert out.status_code == 200
+    with pymupdf.open(stream=out.content, filetype="pdf") as doc:
+        page = doc[0]
+        (image,) = page.get_images(full=True)
+        assert image[8] == "DCTDecode"
+        pix = pymupdf.Pixmap(doc, image[0])
+        scale = pix.width / page.rect.width
+        dark = sum(
+            pix.pixel(int(x * scale), int(y * scale))[0] < 128
+            for x in range(int(box.x0), int(box.x1))
+            for y in range(int(box.y0), int(box.y1))
+        )
+    assert dark == 0  # the fix for ENGINE-01 still holds
+    assert len(out.content) < 2 * len(pdf)
+
+
+def test_redact_refuses_output_above_the_response_cap(client, monkeypatch):
+    """ENGINE R1 (P1): the redact route had no size guard, so a 48-123 MB
+    result was built and then dropped by Cloud Run."""
+    monkeypatch.setattr(pdf_tools, "MAX_RESPONSE_BYTES", 100, raising=False)
+    response = _post(client, "redact", _text_pdf(["ana.costa@exemplo.pt"]), {"strategy": "email"})
+    assert response.status_code == 422
+    assert _error(response)["code"] == "output_too_large"
 
 
 def test_redact_reaches_sticky_notes_and_form_field_appearances(client):
@@ -369,6 +422,18 @@ def test_pdf_to_image_refuses_output_above_the_response_cap(client, monkeypatch)
     assert _error(response)["code"] == "output_too_large"
 
 
+def test_pdf_to_image_names_the_extract_tool_as_the_site_does(client, monkeypatch):
+    """CONTRACT verify (P3): the messages sent users to «Extrair Páginas»; the
+    site calls the tool «Extrair PDF»."""
+    over_cap = _post(client, "pdf-to-image", _text_pdf(["x"], pages=21), {"pages": "all"})
+    monkeypatch.setattr(pdf_tools, "MAX_RESPONSE_BYTES", 1_000, raising=False)
+    jpeg_zip = {"pages": "all", "format": "jpeg"}
+    too_big = _post(client, "pdf-to-image", _text_pdf(["x"], pages=2), jpeg_zip)
+    for response in (over_cap, too_big):
+        message = _error(response)["message"]
+        assert "Extrair PDF" in message and "Extrair Páginas" not in message, message
+
+
 def test_pdf_to_image_password_and_non_pdf_are_user_errors(client):
     """CONTRACT-16 / ENGINE-22 (P2): a protected PDF answered 500, a PNG named
     .pdf answered 200 with the PNG echoed back."""
@@ -430,6 +495,85 @@ def test_ocr_refuses_more_pages_than_fit_the_time_budget(client, monkeypatch):
     assert response.status_code == 422
     assert _error(response)["code"] == "too_many_pages"
     assert str(cap) in _error(response)["message"]
+    # Dividir PDF makes exactly two parts; Extrair PDF takes the range that fits.
+    assert "Extrair PDF" in _error(response)["message"]
+
+
+def test_ocr_budgets_the_pixels_not_only_the_pages(client, monkeypatch):
+    """ENGINE R2 (P2): six photo pages with captions sat under the page cap and
+    took 31 s on the 2 CPU bench (≈55 s on Cloud Run, past the 45 s kill):
+    OCRmyPDF renders a page with any text at 400 dpi, in colour."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    page = pymupdf.open(stream=_photo_scan("Legenda da fotografia"), filetype="pdf")
+    doc = pymupdf.open()
+    for _ in range(5):
+        doc.insert_pdf(page)
+    response = _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
+    assert response.status_code == 422
+    assert _error(response)["code"] == "too_many_pages"
+    assert "até 4 páginas" in _error(response)["message"]
+    assert "Extrair PDF" in _error(response)["message"]
+
+
+def test_ocr_budget_still_takes_eight_ordinary_scans():
+    """The pixel budget must not undercut the page cap for the scans it was
+    measured on: 8 colour A4 pages at 300 dpi, no text (16 s on the bench)."""
+    jpeg = io.BytesIO()
+    Image.new("RGB", (2480, 3508), (235, 230, 220)).save(jpeg, "JPEG")
+    doc = pymupdf.open()
+    for _ in range(pdf_tools.MAX_OCR_PAGES):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=jpeg.getvalue())
+    assert sum(pdf_tools._ocr_megapixels(page) for page in doc) <= pdf_tools.MAX_OCR_MEGAPIXELS
+
+
+def _grey_pixmap(side: int) -> pymupdf.Pixmap:
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, (0, 0, side, side), 0)
+    pix.clear_with(230)
+    return pix
+
+
+def _grey_scan_page(doc, *, footer=None, drawing=False):
+    """A 2 x 2 inch page holding a 200 dpi DeviceGray scan."""
+    page = doc.new_page(width=144, height=144)
+    xref = page.insert_image(page.rect, pixmap=_grey_pixmap(400))
+    doc.xref_set_key(xref, "ColorSpace", "/DeviceGray")
+    if footer:
+        page.insert_text((10, 138), footer, fontsize=6)
+    if drawing:
+        page.draw_rect(pymupdf.Rect(10, 10, 40, 40), color=(0, 0, 0))
+
+
+@pytest.mark.skipif(not can_ocr("eng"), reason=_NO_OCR)
+def test_ocr_megapixels_match_what_ocrmypdf_renders(tmp_path):
+    """The budget is only as good as its model of OCRmyPDF: text lifts a page
+    to 400 dpi, a drawing also to colour, an ICC scan is colour. Compare with
+    the PNG OCRmyPDF itself writes, so an upgrade that changes it goes red."""
+    doc = pymupdf.open()
+    _grey_scan_page(doc)  # 200 dpi, grey
+    _grey_scan_page(doc, footer="Digitalizado com ScanApp")  # 400 dpi, grey
+    _grey_scan_page(doc, drawing=True)  # 400 dpi, colour
+    icc_grey = doc.new_page(width=144, height=144)  # 300 dpi, ICC grey = colour
+    icc_grey.insert_image(icc_grey.rect, pixmap=_grey_pixmap(600))
+    source = tmp_path / "in.pdf"
+    doc.save(source)
+    work = tmp_path / "work"
+    work.mkdir()
+    command = ["ocrmypdf", "-k", "--redo-ocr", "--output-type", "pdf", "-l", "eng"]
+    result = subprocess.run(
+        [*command, source, tmp_path / "out.pdf"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TMPDIR": str(work)},
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-500:]
+    for pno, page in enumerate(pymupdf.open(source), start=1):
+        (raster,) = work.glob(f"*/{pno:06d}_rasterize.png")
+        with Image.open(raster) as im:
+            rendered = im.width * im.height / 1e6 * (1 if im.mode in ("L", "1", "P") else 2)
+        predicted = pdf_tools._ocr_megapixels(page)
+        assert predicted == pytest.approx(rendered, rel=0.02), (pno, im.mode, im.size)
 
 
 def test_ocr_says_when_there_is_nothing_to_recognise(client, monkeypatch):
@@ -704,6 +848,17 @@ def test_zip_page_names_sort_in_page_order(client):
     response = _post(client, "pdf-to-image", _text_pdf(["x"], pages=10), options)
     names = zipfile.ZipFile(io.BytesIO(response.content)).namelist()
     assert names == sorted(names) and names[0] == "pagina-01.jpg"
+
+
+def test_zip_of_page_images_is_compressed(client):
+    """ENGINE R3 (P3): stored, not deflated, the ZIP of a text document's JPG
+    pages grew 37-175% — a document page is mostly white, and deflate still
+    finds it."""
+    options = {"pages": "all", "format": "jpeg"}
+    response = _post(client, "pdf-to-image", _text_pdf(["Relatório"] * 20, pages=3), options)
+    entries = zipfile.ZipFile(io.BytesIO(response.content)).infolist()
+    assert {entry.compress_type for entry in entries} == {zipfile.ZIP_DEFLATED}
+    assert len(response.content) < sum(entry.file_size for entry in entries)
 
 
 @pytest.mark.skipif(not has_soffice(), reason="needs LibreOffice")
