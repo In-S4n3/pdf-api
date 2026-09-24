@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import io
 import json
 import logging
@@ -18,7 +19,6 @@ import time
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
-from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
@@ -120,21 +120,24 @@ LANGUAGE_MAP = {
 # --redo-ocr, not --skip-text: a scan with any real text (a scanner's footer)
 # was skipped whole and came back unsearchable with a 200. No --deskew/--clean
 # (redo refuses --deskew; --deskew also re-encoded every page image to RGB,
-# ~5x the size). --jobs 2 matches Cloud Run's 2 vCPU: os.cpu_count() reports
-# the host's cores and ocrmypdf started 10 workers on 2 CPUs (~1 GB, thrashing).
-# --rotate-pages fixes sideways scans (+21-56% time, included in the cap).
-# Measured on a 2 CPU / 2 GiB box, 2026-09-23: median 1.55 s/page, worst
-# dense 8-page scan 23.4 s — x1.8 for slower amd64 vCPUs is still < 45 s.
-# -j 2 OCRs pages in pairs, so keep the cap even.
-OCR_FLAGS = ("--output-type", "pdf", "--optimize", "0", "--jobs", "2", "--rotate-pages")
-MAX_OCR_PAGES = 8
-# The pages cap alone let 6 photo pages with captions take 31 s on that box
-# (≈55 s on amd64): OCRmyPDF renders any page with text or a vector drawing —
-# a scanner's footer is enough — at 400 dpi, and the time goes into writing
-# those pixels as PNG, twice per page. So the pixels it will render are
-# budgeted too, colour counting twice (_ocr_megapixels): 8 colour A4 scans at
-# 300 dpi weigh 139 (16 s). One page runs on one core, so it gets half.
-# Heaviest accepted on the box, 2026-09-24: 8 A4 photo pages at 300 dpi, 21 s.
+# ~5x the size). --rotate-pages fixes sideways scans (+21-56% time, included in
+# the cap). One worker per vCPU: os.cpu_count() reports the host's cores, and
+# ocrmypdf started 10 workers on 2 CPUs (~1 GB, thrashing). A test holds
+# OCR_JOBS equal to --cpu in .github/workflows/deploy.yml and service.yaml.
+OCR_JOBS = 4
+OCR_FLAGS = ("--output-type", "pdf", "--optimize", "0", "--jobs", str(OCR_JOBS), "--rotate-pages")
+MAX_OCR_PAGES = 8  # two rounds of OCR_JOBS
+# The pages cap alone let 6 photo pages with captions through: OCRmyPDF renders
+# any page with text or a vector drawing — a scanner's footer is enough — at
+# 400 dpi, and the time goes into writing those pixels as PNG, twice per page.
+# So the pixels it will render are budgeted too, colour counting twice
+# (_ocr_megapixels). A page never splits and waits for a free worker, so the
+# busiest worker sets the time: it may render MAX_OCR_MEGAPIXELS / OCR_JOBS.
+# Seconds of processing on Cloud Run gen2, 4 vCPU / 4 GiB, 2026-09-24:
+#   8 grey A4 scans (69.6 Mpx) 17 · 8 colour A4 scans (139.3) 28.5
+#   4 A4 photos with captions (123.7) 39-40 · 8 A4 photos at 300 dpi (139.3) ~45
+# The last sits at the 45 s kill. Gen1 on 2 vCPU ran ~3x slower than the 2 CPU
+# bench box and cut 8 colour scans at 45 s; gen2 alone gained only 11-20 %.
 MAX_OCR_MEGAPIXELS = 150
 # Hand Tesseract at most ~A4 at 300 dpi; the 400 dpi renders above it only
 # cost time (31 → 25 s on those photo pages). Scans up to 300 dpi are untouched.
@@ -961,6 +964,16 @@ def _ocr_megapixels(page) -> float:
     return inches * dpi**2 / 1e6 * (2 if colour else 1)
 
 
+def _busiest_ocr_worker(megapixels: list[float]) -> float:
+    """Megapixels the busiest of OCR_JOBS workers renders. ocrmypdf 17 submits
+    the pages in order to a process pool (builtin_plugins/concurrency.py), so
+    each page goes to the first worker that frees up."""
+    workers = [0.0] * OCR_JOBS
+    for page in megapixels:
+        heapq.heapreplace(workers, workers[0] + page)
+    return max(workers)
+
+
 def ocr_pdf(content: bytes, language: str) -> bytes:
     """Run OCRmyPDF with the requested language on the pages that need it."""
     lang_code = LANGUAGE_MAP.get(language)
@@ -1010,15 +1023,20 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 "Este PDF tem páginas demasiado grandes para OCR (o máximo é A2).",
             )
         megapixels = [_ocr_megapixels(doc[pno - 1]) for pno in pages]
-        if max(megapixels) > MAX_OCR_MEGAPIXELS / 2:
+        worker_budget = MAX_OCR_MEGAPIXELS / OCR_JOBS
+        if max(megapixels) > worker_budget:
             raise ApiError(
                 422,
                 "page_too_large",
                 "Este PDF tem páginas demasiado grandes ou com resolução demasiado alta "
                 "para OCR.",
             )
-        if sum(megapixels) > MAX_OCR_MEGAPIXELS:
-            fit = sum(1 for total in accumulate(megapixels) if total <= MAX_OCR_MEGAPIXELS)
+        if _busiest_ocr_worker(megapixels) > worker_budget:
+            fit = sum(
+                1
+                for n in range(1, len(pages) + 1)
+                if _busiest_ocr_worker(megapixels[:n]) <= worker_budget
+            )
             raise ApiError(
                 422,
                 "too_many_pages",
@@ -1800,7 +1818,7 @@ def pdf_to_docx(content: bytes) -> bytes:
         #   vector items |  2 010 | 15 010 | 30 010 | 40 010 | 50 010
         #   convert time |  0.6 s |  2.5 s | 10.0 s | 19.4 s | 30.7 s
         #
-        # Superlinear, and on hardware faster than the 2-vCPU container.
+        # Superlinear, and on hardware faster than the Cloud Run container.
         # A larger file of 180 plain-text pages carries zero paths and
         # converts in 7.8 s, which is why this counts paths and not size.
         #

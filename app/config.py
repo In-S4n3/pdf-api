@@ -33,7 +33,7 @@ DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # Vector paths a PDF may carry before `pdf_to_docx` refuses it. pdf2docx walks
 # every path hunting for table borders, so its cost tracks path count and not
 # pages or bytes — the curve is in `pdf_to_docx`. Tunable because the one
-# number the curve cannot supply is how much slower the 2-vCPU container is
+# number the curve cannot supply is how much slower the Cloud Run container is
 # than the machine it was measured on: raise or lower it with
 # `gcloud run services update pdf-api --update-env-vars MAX_VECTOR_ITEMS=...`
 # once a real file has been timed in production.

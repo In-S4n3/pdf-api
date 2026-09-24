@@ -7,6 +7,9 @@ metadata:
   name: pdf-api
 spec:
   template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
     spec:
       containerConcurrency: 1
       timeoutSeconds: 60
@@ -14,5 +17,5 @@ spec:
         - image: IMAGE_PLACEHOLDER  # set by the deploy pipeline
           resources:
             limits:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "4"
+              memory: 4Gi

@@ -74,8 +74,9 @@ jobs:
             MAX_UPLOAD_BYTES=20971520
           env_vars_update_strategy: merge
           flags: >-
-            --memory=2Gi
-            --cpu=2
+            --memory=4Gi
+            --cpu=4
+            --execution-environment=gen2
             --concurrency=1
 
       - name: Output service URL

@@ -58,10 +58,13 @@ V1, `/v2/echo` and `/v2/fill-form` stay mounted on purpose (decision of
   Cloud Run drops a non-streamed HTTP/1 response above 32 MiB.
 - OCR: at most 8 pages that need OCR per job, and at most 150 megapixels as
   OCRmyPDF will render them — colour counts twice, and any page with text or a
-  drawing renders at 400 dpi (8 colour A4 scans at 300 dpi weigh 139; measured on
-  2 vCPU / 2 GiB, the heaviest accepted job takes ~21 s against the 45 s tool
-  budget). Both answer `too_many_pages` with the number that fits. Born-digital
-  pages are skipped; a file with nothing to recognise answers `already_searchable`.
+  drawing renders at 400 dpi. It runs 4 pages at a time, one per vCPU, so each
+  worker gets at most 37.5 Mpx. On Cloud Run gen2 with 4 vCPU, 8 colour A4 scans
+  at 300 dpi (139 Mpx) take 28.5 s, 4 A4 photos with captions (124) ~40 s, and
+  8 A4 photos at 300 dpi sit at the 45 s tool budget. Too many pages answer
+  `too_many_pages` with the number that fits; one page above 37.5 Mpx (an A3
+  colour page with text) answers `page_too_large`. Born-digital pages are
+  skipped; a file with nothing to recognise answers `already_searchable`.
 - Rendering (PDF to image) stays within 40 Mpx per page: 300 dpi up to A2, less
   for larger pages. Embedded images above 150 Mpx are refused (`image_too_large`).
 - Protect passwords are at most 127 UTF-8 bytes — every PDF reader truncates there.
