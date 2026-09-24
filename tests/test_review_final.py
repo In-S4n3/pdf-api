@@ -609,6 +609,64 @@ def _deep_chain(depth: int) -> bytes:
     return _raw_pdf(objects)
 
 
+def _four_pages(kids: bytes, count: int, extra: dict[int, bytes] | None = None) -> bytes:
+    """Pages 21–24 under the /Pages node 2, whose /Kids and /Count are given as is."""
+    objects = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, count),
+        3: _HELVETICA,
+        **(extra or {}),
+    }
+    for n in range(1, 5):
+        text = b"BT /F1 12 Tf 72 700 Td (Pagina %d) Tj ET" % n
+        objects[10 + n] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(text), text)
+        objects[20 + n] = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents %d 0 R"
+            b" /Resources << /Font << /F1 3 0 R >> >> >>" % (10 + n)
+        )
+    return _raw_pdf(objects)
+
+
+_UNOPENABLE_KIDS = {
+    "null": _four_pages(b"21 0 R 22 0 R null 23 0 R 24 0 R", 4),
+    "missing object": _four_pages(b"21 0 R 22 0 R 99 0 R 23 0 R 24 0 R", 4),
+    "cycle": _four_pages(
+        b"21 0 R 22 0 R 5 0 R",
+        4,
+        {5: b"<< /Type /Pages /Parent 2 0 R /Kids [2 0 R 23 0 R] /Count 2 >>"},
+    ),
+}
+_PDFA = ("pdfa", {"conformance": "pdfa-2b"})
+
+
+@pytest.mark.parametrize("kids", _UNOPENABLE_KIDS)
+@pytest.mark.parametrize(("endpoint", "options"), [*_MUPDF_TOOLS, _PDFA])
+def test_a_page_tree_entry_mupdf_cannot_open_is_refused(client, kids, endpoint, options):
+    """A /Kids entry that is null, a missing object or a node reached twice (a cycle):
+    MuPDF counts it and fails on it, a 500 on most tools (b0687b4..defc964), while
+    Flatten returned pages shifted out of place behind a 200."""
+    if endpoint == "pdfa" and not pdfa_resources_present():
+        pytest.skip(_NO_GS)
+    response = _post(client, endpoint, _UNOPENABLE_KIDS[kids], options)
+    assert response.status_code == 422, response.content[:200]
+    assert _error(response)["code"] == "damaged_pdf"
+
+
+_MISREAD_TREES = {"count 3 over 4": _count_mismatch(3), **_UNOPENABLE_KIDS}
+
+
+@pytest.mark.parametrize("tree", _MISREAD_TREES)
+def test_repair_fixes_a_page_tree_the_tools_refuse(client, tree):
+    """Every tool refuses these with «Use primeiro a ferramenta Reparar PDF», and Repair
+    called them already-healthy and returned them unchanged: a dead end."""
+    response = _post(client, "pdf-repair", _MISREAD_TREES[tree])
+    assert response.status_code == 200, response.content[:200]
+    assert response.headers["X-Repair-Status"] != "already-healthy"
+    recovered = int(response.headers["X-Repair-Pages"].split("/")[0])
+    assert len(_texts(response.content)) == recovered  # 4 of 4; the cycle, 2 of 4 by gs
+    pdf_tools._open_pdf(response.content).close()  # the tools now accept it
+
+
 def test_the_qpdf_page_count_survives_a_page_tree_40000_levels_deep():
     """A6: PDF/A counted pages with pikepdf inside the API process; qpdf recurses down
     the page tree, and 40 000 levels overflowed its stack and killed the worker (SIGBUS)."""

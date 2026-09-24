@@ -45,8 +45,9 @@ def _has_syntax_issues(content: bytes) -> bool:
 _CONTENT_DAMAGE = ("treating", "unknown token", "decoding stream", "unexpected")
 
 
-def _mupdf_page_count(content: bytes) -> int:
-    """Pages MuPDF walks in the document (0 when unreadable).
+def _mupdf_pages(content: bytes) -> tuple[int, list[int] | None]:
+    """Pages MuPDF walks in the document (0 when unreadable), and their objects
+    (None when the walk fails).
 
     qpdf rebuilds a truncated file's page tree from what survives, so a
     60-page file cut in half read as 30 of 30 — "all pages recovered". Walked,
@@ -59,16 +60,17 @@ def _mupdf_page_count(content: bytes) -> int:
 
         with pymupdf.open(stream=content, filetype="pdf") as doc:
             try:
-                return sum(1 for _ in doc)
+                xrefs = [page.xref for page in doc]
+                return len(xrefs), xrefs
             except Exception:
-                return doc.page_count
+                return doc.page_count, None
     except Exception:
-        return 0
+        return 0, None
 
 
 def _classify(content: bytes) -> tuple[dict, bytes | None]:
     """Run Tier-1 repair + verdict. Returns (meta_dict, output_bytes_or_None)."""
-    declared = _mupdf_page_count(content)
+    declared, mupdf_pages = _mupdf_pages(content)
     try:
         pdf = pikepdf.open(io.BytesIO(content))
     except pikepdf.PasswordError:  # SIBLING of PdfError — own handler, FIRST
@@ -81,6 +83,17 @@ def _classify(content: bytes) -> tuple[dict, bytes | None]:
         try:
             # pages recoverable AT OPEN TIME (post-recovery), against what the file declares
             m = max(len(pdf.pages), declared)
+            # Every other tool reads pages with MuPDF, and refuses a tree where it
+            # does not see qpdf's pages in qpdf's order (a /Count 3 over 4, a null
+            # /Kids entry) with «use Reparar». qpdf's save keeps the tree as it is:
+            # rebuild it as one /Kids list, /Count exact.
+            rebuilt = mupdf_pages != [page.objgen[0] for page in pdf.pages]
+            if rebuilt:
+                pages = [page.obj for page in pdf.pages]
+                pdf.Root.Pages.Kids = pikepdf.Array(pages)
+                pdf.Root.Pages.Count = len(pages)
+                for page in pages:
+                    page.Parent = pdf.Root.Pages
         except Exception:
             return {"outcome": "escalate", "baseline": declared or None}, None
         try:
@@ -110,7 +123,7 @@ def _classify(content: bytes) -> tuple[dict, bytes | None]:
 
     if n < m:
         status = "partial"          # real page loss ONLY
-    elif not input_dirty:
+    elif not input_dirty and not rebuilt:
         status = "already-healthy"  # input was already clean
     else:
         status = "repaired"

@@ -528,8 +528,8 @@ def _open_pdf(content: bytes, *, hidden_pages_ok: bool = False):
     """Open an uploaded PDF, or refuse it with the error every tool shares.
 
     Not a PDF / unreadable → 400 invalid_pdf; open password → 400
-    password_protected_pdf; no pages, only partly readable, or pages MuPDF does
-    not see (unless hidden_pages_ok) → 422 damaged_pdf.
+    password_protected_pdf; no pages, only partly readable, or a page tree MuPDF
+    misreads (see _check_page_tree) → 422 damaged_pdf.
     """
     _pdf_start(content)
     try:
@@ -543,8 +543,7 @@ def _open_pdf(content: bytes, *, hidden_pages_ok: bool = False):
             empty = doc.page_count == 0  # MuPDF refuses a /Count above its object count
         except Exception as exc:
             raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE) from exc
-        if not hidden_pages_ok:
-            _refuse_hidden_pages(doc, content)
+        _check_page_tree(doc, content, hidden_pages_ok=hidden_pages_ok)
         if empty:
             if doc.is_repaired:
                 raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
@@ -565,43 +564,48 @@ def _open_pdf(content: bytes, *, hidden_pages_ok: bool = False):
     return doc
 
 
-def _refuse_hidden_pages(doc, content: bytes) -> None:
-    """422 when the page tree's /Kids hold more pages than MuPDF counts.
+def _check_page_tree(doc, content: bytes, *, hidden_pages_ok: bool = False) -> None:
+    """422 when MuPDF would misread the page tree.
 
     MuPDF takes the number of pages from the tree's /Count; qpdf, Ghostscript and
     viewers follow /Kids. /Count 3 over 4 pages hid page 4 from every tool while
-    the saved file still showed it: Censurar left its email readable. Walked
-    without recursion, each /Pages node once, a repeated kid counted each time;
+    the saved file still showed it: Censurar left its email readable (unless
+    hidden_pages_ok). A /Kids entry MuPDF cannot open — null, a missing object, a
+    node reached twice (a cycle) — still counts: a 500 on most tools. Walked
+    without recursion, each /Pages node once, a repeated page counted each time;
     past MAX_PAGE_TREE_WALK objects qpdf counts instead, in its own process.
     """
     size, limit = doc.xref_length(), doc.page_count
-    pages, walked = 0, 0
+    pages, walked, broken = 0, 0, False
     try:
         kind, root = doc.xref_get_key(doc.pdf_catalog(), "Pages")
         stack = [(int(root.split()[0]), 1)] if kind == "xref" else []
         nodes = set()
-        while stack and pages <= limit and walked < MAX_PAGE_TREE_WALK:
+        while stack and not broken and pages <= limit and walked < MAX_PAGE_TREE_WALK:
             xref, times = stack.pop()
             walked += 1
-            if not 0 < xref < size:
-                continue
-            kind, kids = doc.xref_get_key(xref, "Kids")
+            kind, kids = doc.xref_get_key(xref, "Kids") if 0 < xref < size else ("null", "")
             if kind == "null":
-                # a dictionary, not a stream: what qpdf and pdf.js show as a page
-                if not doc.xref_is_stream(xref) and doc.xref_get_keys(xref):
-                    pages += times
-            elif xref not in nodes:  # a /Pages node, walked once: a cycle ends here
+                # a page is a dictionary, not a stream: what qpdf and pdf.js show
+                page = 0 < xref < size and not doc.xref_is_stream(xref) and doc.xref_get_keys(xref)
+                broken, pages = not page, pages + times
+            elif kind not in ("array", "xref") or xref in nodes:
+                broken = True  # a node reached twice: a cycle
+            else:
                 nodes.add(xref)
                 if kind == "xref":  # an indirect /Kids array
                     kids = doc.xref_object(int(kids.split()[0]))
+                broken = bool(_re.sub(r"\d+ \d+ R|[\[\]\s]", "", kids))  # a null, a number
                 refs = Counter(m[1] for m in _re.finditer(r"(\d+) \d+ R", kids))
                 stack += [(int(kid), n) for kid, n in refs.items()]
     except Exception:
         return  # unreadable tree: the damaged-file checks after this decide
-    if stack and pages <= limit:  # too big to walk here
+    if hidden_pages_ok and not broken:
+        return
+    if stack and not broken and pages <= limit:  # too big to walk here
         counted = _qpdf_page_count(content)
         pages = limit + 1 if counted is None else counted  # cannot tell: refuse
-    if pages > limit:
+    if broken or pages > limit:
         raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
 
 
