@@ -124,7 +124,7 @@ def test_too_many_pages(monkeypatch):
     monkeypatch.setattr(pdf_tools, "MAX_PAGES", 1)
     with pytest.raises(ApiError) as exc:
         unlock_pdf(_make_owner_only_pdf(pages=3))
-    assert exc.value.status_code == 400
+    assert exc.value.status_code == 422
     assert exc.value.code == "too_many_pages"
 
 
@@ -153,7 +153,7 @@ def test_retry_open_pdferror_maps_to_422_not_500(monkeypatch):
 
     monkeypatch.setattr(pikepdf, "open", fake_open)
     with pytest.raises(ApiError) as exc:
-        unlock_pdf(b"irrelevant", "somepass")
+        unlock_pdf(b"%PDF-1.7 irrelevant", "somepass")  # past the %PDF header check
     assert exc.value.status_code == 422
     assert exc.value.code == "unsupported_encryption"
 

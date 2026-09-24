@@ -77,11 +77,11 @@ def test_corrupt_bytes_raise_400():
     assert exc.value.code == "invalid_pdf"
 
 
-def test_too_many_pages_raises_400(monkeypatch):
+def test_too_many_pages_raises_422(monkeypatch):
     monkeypatch.setattr(pdf_tools, "MAX_PAGES", 1)
     with pytest.raises(ApiError) as exc:
         pdf_to_xlsx(g.blank_pdf(pages=3))
-    assert exc.value.status_code == 400
+    assert exc.value.status_code == 422
     assert exc.value.code == "too_many_pages"
 
 
@@ -108,8 +108,9 @@ def test_sparse_table_returns_200_not_scanned():
     wb = _load(pdf_to_xlsx(g.sparse_table_pdf()))
     assert len(wb.worksheets) == 1
     ws = wb.worksheets[0]
-    assert ws["A1"].value == "1"
-    assert ws["B2"].value == "4"
+    # Unambiguous numbers are stored as numbers (SUM works in Excel).
+    assert ws["A1"].value == 1
+    assert ws["B2"].value == 4
 
 
 # --- formula/error injection neutralization ---------------------------------
@@ -126,7 +127,7 @@ def test_injection_cells_reload_as_literal_text():
     assert error_cell.value == "#REF!"
     # benign cells untouched
     assert ws["A2"].value == "normal"
-    assert ws["B2"].value == "42"
+    assert ws["B2"].value == 42
 
 
 # --- _sheet_title unit ------------------------------------------------------

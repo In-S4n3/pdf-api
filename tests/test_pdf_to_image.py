@@ -102,7 +102,7 @@ def test_invalid_pdf_returns_400_portuguese(client):
     )
     assert response.status_code == 400
     body = response.json()
-    assert body["error"] == "Não foi possível abrir o PDF. Verifique se o ficheiro é válido."
+    assert body["error"] == "O ficheiro não é um PDF válido."
 
 
 def test_missing_file_returns_422(client):
@@ -197,15 +197,15 @@ def test_all_pages_zip_content_disposition(client):
     assert "relatorio-imagens.zip" in response.headers.get("content-disposition", "")
 
 
-def test_too_many_pages_returns_400(client):
-    """PDF with >20 pages and pages=all returns 400 too_many_pages."""
+def test_too_many_pages_returns_422(client):
+    """PDF with >20 pages and pages=all returns 422 too_many_pages."""
     pdf_bytes = _make_test_pdf(pages=21)
     response = client.post(
         "/v2/pdf-to-image",
         files={"file": ("big.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
         data={"options": json.dumps({"pages": "all"})},
     )
-    assert response.status_code == 400
+    assert response.status_code == 422
     body = response.json()
     assert body["error"]["code"] == "too_many_pages"
 

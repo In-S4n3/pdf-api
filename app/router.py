@@ -6,9 +6,7 @@ and included here. The health endpoint is defined inline.
 
 from fastapi import APIRouter
 
-from app.http_utils import run_service
 from app.router_v2 import router as v2_router
-from app.services.pdf_tools import build_health_payload
 from app.tools.compress import router as compress_router
 from app.tools.convert import router as convert_router
 from app.tools.echo import router as echo_router
@@ -36,5 +34,5 @@ router.include_router(v2_router)
 
 @router.get("/health")
 async def health():
-    """Return service status and library versions (D-05)."""
-    return await run_service(build_health_payload)
+    """Return service status only — no library versions, no subprocesses (see /v2/health)."""
+    return {"status": "ok"}

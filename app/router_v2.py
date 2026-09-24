@@ -7,12 +7,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 
-from app.api_errors import ApiError
 from app.auth import verify_api_key
 from app.http_utils import file_response, filename_stem, read_upload_bytes, run_service
 from app.services.pdf_tools import (
+    PREVIEW_MATCH_CAP,
+    REDACTION_LOCK,
     _iter_matches,
-    build_health_payload,
+    _open_pdf,
     compress_pdf,
     convert_pdf_to_pdfa,
     convert_to_pdf,
@@ -60,14 +61,15 @@ RedactPreviewOptionsDep = Annotated[
 
 # Caps payload size on pathological inputs (e.g. a regex that matches every
 # word on every page). Frontend uses `truncated` to surface a "refine pattern"
-# nudge instead of silently dropping matches.
-_PREVIEW_MATCH_CAP = 5000
+# nudge; /v2/redact still removes the matches past the cap.
+_PREVIEW_MATCH_CAP = PREVIEW_MATCH_CAP
 
 
 @router.get("/health")
 async def health_v2():
-    payload = await run_service(build_health_payload)
-    return payload
+    # Status only: no versions (they told an attacker which CVEs to try) and no
+    # subprocesses (each unauthenticated call started gs, tesseract and soffice).
+    return {"status": "ok"}
 
 
 @router.post("/echo")
@@ -279,25 +281,20 @@ def _extract_matches_json(
     Lives in the route module (not pdf_tools) because it is purely a transport
     concern — the service helper deliberately returns the dataclass, not JSON.
     """
-    import pymupdf
-
-    try:
-        doc = pymupdf.open(stream=content, filetype="pdf")
-    except Exception as exc:
-        raise ApiError(
-            400,
-            "invalid_pdf",
-            "Não foi possível abrir o PDF. Verifique se o ficheiro é válido.",
-        ) from exc
-
+    doc = _open_pdf(content)
     try:
         # _iter_matches raises password/regex/page/time errors as ApiError;
-        # middleware turns those into the v2 envelope.
+        # middleware turns those into the v2 envelope. The lock keeps the scan
+        # from overlapping an apply (MuPDF state is process-global).
         matches_json: list[dict[str, object]] = []
         total = 0
-        for match in _iter_matches(
-            doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern
-        ):
+        with REDACTION_LOCK:
+            matches = list(
+                _iter_matches(
+                    doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern
+                )
+            )
+        for match in matches:
             total += 1
             if len(matches_json) >= match_cap:
                 continue

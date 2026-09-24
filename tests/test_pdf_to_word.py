@@ -158,7 +158,7 @@ def test_vector_heavy_pdf_raises_422_instead_of_timing_out():
     with pytest.raises(ApiError) as exc:
         pdf_to_docx(_vector_pdf(pages=10, items_per_page=5000))
     assert exc.value.status_code == 422
-    assert exc.value.code == "too_complex_pdf"
+    assert exc.value.code == "pdf_too_complex"
 
 
 def test_moderate_vector_pdf_still_converts():
@@ -196,7 +196,7 @@ def test_max_vector_items_env_var_tunes_the_gate(monkeypatch):
     with pytest.raises(ApiError) as exc:
         pdf_to_docx(ordinary)
     assert exc.value.status_code == 422
-    assert exc.value.code == "too_complex_pdf"
+    assert exc.value.code == "pdf_too_complex"
 
     monkeypatch.setenv("MAX_VECTOR_ITEMS", "10000")
     assert len(pdf_to_docx(ordinary)) > 0

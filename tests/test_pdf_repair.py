@@ -35,7 +35,7 @@ def test_non_pdf_bytes_rejected():
     with pytest.raises(ApiError) as e:
         repair_pdf(b"this is not a pdf at all")
     assert e.value.status_code == 400
-    assert e.value.code == "not_a_pdf"
+    assert e.value.code == "invalid_pdf"
 
 
 def test_encrypted_pdf_steers_to_unlock():

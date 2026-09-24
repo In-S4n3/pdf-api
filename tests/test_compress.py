@@ -47,21 +47,26 @@ def test_compress_returns_valid_pdf(client):
     doc.close()
 
 
-def test_compress_handles_text_only_pdf(client, sample_pdf):
-    """Text-only PDFs still get processed without error (deflate + garbage)."""
+def test_compress_refuses_a_file_it_cannot_shrink(client, sample_pdf):
+    """sample.pdf came back 302 -> 608 bytes with a 200 and was sold as
+    compressed. Not smaller -> 422 compress_no_gain, which TudoPDF shows as a
+    friendly, non-billable outcome (decision 16)."""
     response = client.post(
-        "/compress",
+        "/v2/compress",
         files={"file": ("text.pdf", io.BytesIO(sample_pdf), "application/pdf")},
+        data={"options": "{}"},
     )
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/pdf"
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "compress_no_gain"
+    assert error["message"] == "Este PDF já está otimizado: não conseguimos reduzir mais o tamanho."
 
 
-def test_compress_preserves_filename(client, sample_pdf):
+def test_compress_preserves_filename(client):
     """Compress endpoint includes the original filename in Content-Disposition."""
     response = client.post(
         "/compress",
-        files={"file": ("my-doc.pdf", io.BytesIO(sample_pdf), "application/pdf")},
+        files={"file": ("my-doc.pdf", io.BytesIO(_make_image_pdf()), "application/pdf")},
     )
     assert response.status_code == 200
     assert "my-doc.pdf" in response.headers.get("content-disposition", "")

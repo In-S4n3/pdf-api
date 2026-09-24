@@ -15,7 +15,9 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api_errors import ApiError
+from app.auth import check_api_key
 from app.config import DEBUG, get_settings
+from app.http_utils import upload_too_large_message
 from app.router import router
 
 logger = logging.getLogger(__name__)
@@ -70,12 +72,49 @@ app = FastAPI(
 )
 
 
+# Room for the multipart framing and the `options` field (Starlette caps a
+# non-file part at 1 MiB) on top of the file itself.
+MULTIPART_ALLOWANCE = 1024 * 1024 + 64 * 1024
+
+
+def _presented_api_key(request: Request) -> str | None:
+    key = request.headers.get("x-api-key")
+    if key:
+        return key
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    return token.strip() if scheme.lower() == "bearer" and token.strip() else None
+
+
+async def _reject_before_body(request: Request):
+    """Answer auth failures and oversized uploads before the body is read.
+
+    FastAPI parses the multipart form — spooling the whole upload into
+    RAM-backed /tmp — before it runs any dependency, so a 25 MiB request
+    without a key was read in full just to be told 401, and one with a key
+    to be told 413. The dependency stays as defence in depth.
+    """
+    if request.method != "POST":
+        return None
+    try:
+        check_api_key(_presented_api_key(request))
+    except StarletteHTTPException as exc:
+        return await http_exception_handler(request, exc)
+    declared = request.headers.get("content-length", "")
+    max_bytes = get_settings().max_upload_bytes
+    if declared.isdigit() and int(declared) > max_bytes + MULTIPART_ALLOWANCE:
+        return await api_error_handler(
+            request,
+            ApiError(413, "file_too_large", upload_too_large_message(max_bytes)),
+        )
+    return None
+
+
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     """Attach a request id to every response for easier debugging."""
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
     try:
-        response = await call_next(request)
+        response = await _reject_before_body(request) or await call_next(request)
     except Exception:
         logger.exception(
             "Unhandled request failure (request_id=%s)",
@@ -132,6 +171,9 @@ async def api_error_handler(request: Request, exc: ApiError):
     )
 
 
+_V2_HTTP_MESSAGES = {404: "Endereço não encontrado.", 405: "Método não permitido."}
+
+
 # Registered on Starlette's class, not FastAPI's subclass: the router raises the
 # base class for an unmatched path or method, and a handler on the subclass let
 # those out as Starlette's own `{"detail": "Not Found"}` — outside the v2
@@ -143,7 +185,23 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     # this one must too.
     headers = getattr(exc, "headers", None)
     if _is_v2_request(request):
-        message = exc.detail if isinstance(exc.detail, str) else "HTTP request failed."
+        if exc.status_code == 400:
+            # Starlette's multipart parser: "Part exceeded maximum size of
+            # 1024KB." and friends. A malformed request, not a server fault.
+            return JSONResponse(
+                status_code=400,
+                content=_v2_error_content(
+                    request,
+                    code="invalid_request",
+                    message=(
+                        "Não foi possível ler o pedido (formulário inválido ou demasiado grande)."
+                    ),
+                ),
+                headers=headers,
+            )
+        message = _V2_HTTP_MESSAGES.get(exc.status_code) or (
+            exc.detail if isinstance(exc.detail, str) else "HTTP request failed."
+        )
         return JSONResponse(
             status_code=exc.status_code,
             content=_v2_error_content(
@@ -172,7 +230,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 request,
                 code="invalid_request",
                 message="O pedido não passou a validação.",
-                details=exc.errors(),
+                # type/loc/msg only: no echoed input, no pydantic doc URLs.
+                details=[
+                    {key: error[key] for key in ("type", "loc", "msg") if key in error}
+                    for error in exc.errors()
+                ],
             ),
         )
 

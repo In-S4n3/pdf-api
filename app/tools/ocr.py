@@ -1,7 +1,7 @@
 """OCR endpoint -- adds searchable text layer to scanned PDFs.
 
-Uses OCRmyPDF CLI (subprocess) with --skip-text to OCR pages
-that lack a text layer. Supports 8 languages via Tesseract.
+Uses OCRmyPDF CLI (subprocess) with --redo-ocr on the pages that are
+mostly image or lack visible text. Supports 8 languages via Tesseract.
 """
 
 from typing import Annotated

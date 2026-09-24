@@ -103,9 +103,9 @@ class RedactPreviewOptions(StrictOptionsModel):
     @model_validator(mode="after")
     def validate_strategy_inputs(self) -> RedactPreviewOptions:
         if self.strategy == RedactionStrategy.custom and not self.customText.strip():
-            raise ValueError("customText is required when strategy='custom'.")
+            raise ValueError("Texto personalizado é obrigatório.")
         if self.strategy == RedactionStrategy.regex and not self.regexPattern.strip():
-            raise ValueError("regexPattern is required when strategy='regex'.")
+            raise ValueError("Padrão regex é obrigatório.")
         return self
 
 
@@ -121,9 +121,9 @@ class RedactOptions(StrictOptionsModel):
     @model_validator(mode="after")
     def validate_strategy_inputs(self) -> RedactOptions:
         if self.strategy == RedactionStrategy.custom and not self.customText.strip():
-            raise ValueError("customText is required when strategy='custom'.")
+            raise ValueError("Texto personalizado é obrigatório.")
         if self.strategy == RedactionStrategy.regex and not self.regexPattern.strip():
-            raise ValueError("regexPattern is required when strategy='regex'.")
+            raise ValueError("Padrão regex é obrigatório.")
         return self
 
 
@@ -144,11 +144,17 @@ def options_dependency[OptionsModel: StrictOptionsModel](
             # include_context=False strips ctx.error (which can hold a non-JSON-
             # serializable ValueError instance from @model_validator branches),
             # otherwise FastAPI's response serializer crashes with TypeError.
+            errors = exc.errors(include_context=False, include_url=False, include_input=False)
+            # Our own validators speak Portuguese; say their sentence, not
+            # the generic one ("Value error, " is pydantic's prefix).
+            own = [
+                e["msg"].removeprefix("Value error, ") for e in errors if e["type"] == "value_error"
+            ]
             raise ApiError(
                 status_code=422,
                 code="invalid_options",
-                message="As opções não passaram a validação.",
-                details=exc.errors(include_context=False),
+                message=own[0] if own else "As opções não passaram a validação.",
+                details=errors,
             ) from exc
 
     return Depends(dependency)

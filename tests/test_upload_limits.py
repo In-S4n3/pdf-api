@@ -34,7 +34,7 @@ def test_oversized_upload_returns_413(client, monkeypatch):
     assert response.status_code == 413
     body = response.json()
     assert body["error"]["code"] == "file_too_large"
-    assert "1024" in body["error"]["message"]
+    assert body["error"]["message"] == "O ficheiro excede o limite de 1 KB."
 
 
 def test_small_upload_passes_size_gate(client, monkeypatch, sample_pdf):

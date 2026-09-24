@@ -220,14 +220,15 @@ def test_convert_png_returns_pdf(client):
 
 
 def test_convert_rejects_unsupported_type(client):
-    """Unsupported MIME type returns 400 with Portuguese error message."""
+    """Unsupported type returns 415 with a Portuguese message listing the formats."""
     response = client.post(
         "/convert",
         files={"file": ("readme.txt", io.BytesIO(b"hello world"), "text/plain")},
         data={"options": "{}"},
     )
-    assert response.status_code == 400
+    assert response.status_code == 415
     assert "Formato não suportado" in response.json()["error"]
+    assert "DOCX, XLSX, PPTX, JPG, PNG e TIFF" in response.json()["error"]
 
 
 def test_convert_rejects_missing_file(client):

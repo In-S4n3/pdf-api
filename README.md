@@ -12,8 +12,7 @@ docker compose up --build
 
 The API will be available at `http://localhost:8000`.
 
-- Health check: `GET /health`
-- V2 health check: `GET /v2/health`
+- Health check: `GET /health` / `GET /v2/health` — `{"status": "ok"}` only (no versions, no subprocesses)
 - API docs in development: `GET /docs`
 - Echo test: `POST /echo` (multipart file upload)
 - V2 tools: `POST /v2/<tool>`
@@ -47,6 +46,23 @@ Frontend migration notes live in `docs/frontend-v2-migration.md`.
 `POST /v2/fill-form` is deprecated because TudoPDF now fills forms entirely in
 the browser. It remains available without a removal date and sends the standard
 `Deprecation` and `Link` response headers so consumers can migrate safely.
+
+V1, `/v2/echo` and `/v2/fill-form` stay mounted on purpose (decision of
+2026-09-23): TudoPDF calls none of them, but the deploy smoke test posts to
+`/v2/echo` to prove the API key fails closed.
+
+## Limits a caller should know
+
+- Uploads up to 20 MiB; an oversized `Content-Length` or a missing/wrong key is
+  refused before the body is read. Responses stop at 30 MiB (`output_too_large`):
+  Cloud Run drops a non-streamed HTTP/1 response above 32 MiB.
+- OCR: at most 8 pages that need OCR per job (measured on 2 vCPU / 2 GiB: a dense
+  8-page scan takes ~22 s against the 45 s tool budget). Born-digital pages are
+  skipped; a file with nothing to recognise answers `already_searchable`.
+- Rendering (PDF to image) stays within 40 Mpx per page: 300 dpi up to A2, less
+  for larger pages. Embedded images above 150 Mpx are refused (`image_too_large`).
+- Protect passwords are at most 127 UTF-8 bytes — every PDF reader truncates there.
+- Compress answers `422 compress_no_gain` when the result is not smaller.
 
 ## License
 

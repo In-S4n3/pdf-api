@@ -36,12 +36,15 @@ def sanitize_filename(filename: str | None, default: str) -> str:
     candidate = Path((filename or default).replace("\\", "/")).name or default
     # NFC, not whatever arrived: macOS uploads decompose «ã» into a + U+0303,
     # and Windows and Linux both expect the composed form on the way back out.
+    # Format characters (Cf) go too: U+202E turned "fileRLOgnp.exe.pdf" into
+    # a name that displays as "file…fdp.exe.png".
     cleaned = "".join(
         character
         for character in unicodedata.normalize("NFC", candidate).replace('"', "")
         if ord(character) >= 32 and ord(character) != 127
+        and unicodedata.category(character) != "Cf"
     )
-    if not cleaned:
+    if not cleaned.strip(" ."):
         return default
     if len(cleaned) <= MAX_FILENAME_LENGTH:
         return cleaned
@@ -122,7 +125,7 @@ def parse_options_json(
     """Parse an options JSON string into a dictionary."""
     try:
         parsed = json.loads(raw_options or "{}")
-    except JSONDecodeError as exc:
+    except (JSONDecodeError, RecursionError) as exc:  # 100k "[" used to 500
         raise ApiError(
             status_code=400,
             code="invalid_options",
@@ -150,12 +153,19 @@ def parse_legacy_options(raw_options: str) -> dict[str, Any]:
 _READ_CHUNK_SIZE = 64 * 1024  # 64 KB
 
 
+def upload_too_large_message(max_bytes: int) -> str:
+    mib = 1024 * 1024
+    limit = f"{max_bytes // mib} MB" if max_bytes >= mib else f"{max_bytes // 1024} KB"
+    return f"O ficheiro excede o limite de {limit}."
+
+
 async def read_upload_bytes(file: UploadFile, *, legacy: bool = False) -> bytes:
     """Read upload bytes in chunks, aborting as soon as the size limit is exceeded.
 
-    Reading the entire payload before checking length lets an attacker OOM the
-    container with a single oversized request. Streaming and bailing early caps
-    peak memory at `max_upload_bytes + chunk_size`.
+    By the time this runs Starlette has already spooled the part (1 MiB in RAM,
+    the rest to /tmp); the middleware refuses an oversized Content-Length before
+    that. This check is exact on the file itself and bounds our own copy at
+    `max_upload_bytes + chunk_size`.
     """
     settings = get_settings()
     max_bytes = settings.max_upload_bytes
@@ -170,7 +180,7 @@ async def read_upload_bytes(file: UploadFile, *, legacy: bool = False) -> bytes:
             message = (
                 f"Uploaded file exceeds the configured limit of {max_bytes} bytes."
                 if legacy
-                else f"O ficheiro excede o limite configurado de {max_bytes} bytes."
+                else upload_too_large_message(max_bytes)
             )
             error = ApiError(
                 status_code=413,
