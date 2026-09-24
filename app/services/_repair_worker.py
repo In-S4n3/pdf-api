@@ -51,13 +51,17 @@ def _mupdf_page_count(content: bytes) -> int:
     qpdf rebuilds a truncated file's page tree from what survives, so a
     60-page file cut in half read as 30 of 30 — "all pages recovered". Walked,
     not page_count: that is the tree's /Count, and a /Count of 6 over 4 intact
-    pages read as "4 of 6 recovered".
+    pages read as "4 of 6 recovered". Where the walk itself fails (a /Pages
+    node is gone) the /Count is all there is: 0 read 10 lost of 30 as 20 of 20.
     """
     try:
         import pymupdf
 
         with pymupdf.open(stream=content, filetype="pdf") as doc:
-            return sum(1 for _ in doc)
+            try:
+                return sum(1 for _ in doc)
+            except Exception:
+                return doc.page_count
     except Exception:
         return 0
 

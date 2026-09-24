@@ -302,18 +302,24 @@ def _iter_matches(
     # survived in a note's /Contents and in a field's appearance stream. Baking
     # turns every annotation and widget appearance into page content (a note's
     # hidden /Contents is dropped), so preview, ids and removal see one text.
-    # Two kinds are not baked: a print-only (NoView) mark would show on screen,
-    # and a /Redact mark another editor left pending means "remove this" — baked,
-    # it became an outline over text that stays readable.
+    # Two kinds are not baked: a print-only (NoView) mark or form field would
+    # show on screen, and a /Redact mark another editor left pending means
+    # "remove this" — baked, it became an outline over text that stays readable.
+    no_view = pymupdf.PDF_ANNOT_IS_NO_VIEW
     pymupdf.TOOLS.set_small_glyph_heights(True)
     try:
         for page in doc:
-            for annot in [a for a in page.annots() if a.flags & pymupdf.PDF_ANNOT_IS_NO_VIEW]:
+            for annot in [a for a in page.annots() if a.flags & no_view]:
                 page.delete_annot(annot)
-            if next(page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)), None) is not None:
+            for field in [w for w in page.widgets() if w._annot.flags & no_view]:
+                page.delete_widget(field)  # page.annots() skips form fields
+            marks = list(page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)))
+            if marks:
                 # Applying the mark decodes the images under it: budget first, or a
                 # 32 KB file peaks at 605 MiB, in a preview that costs no free use.
                 _check_image_budget(doc, pages=[page.number])
+                for mark in marks:
+                    _prepare_pending_mark(page, mark)
                 jpeg_boxes = _jpeg_image_boxes(page)
                 page.apply_redactions(
                     images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
@@ -362,6 +368,36 @@ def _iter_matches(
                         continue
                     seen_ids.add(match.id)
                     yield match
+
+
+def _prepare_pending_mark(page, mark) -> None:
+    """Ready a /Redact mark another editor left for apply_redactions.
+
+    PyMuPDF writes the mark's overlay text in its /DA font and has metrics for
+    the 14 base fonts (and its CJK ones) only: /ArialMT, as other editors write
+    it, answered 500. Such a mark keeps its fill, without the text. And PyMuPDF
+    paints the fill over the whole /Rect while MuPDF removes the text under the
+    QuadPoints only: a mark over the end of one line and the start of the next
+    blacked out both lines, the unmarked text still in the file. So a mark with
+    quads becomes one mark per quad.
+    """
+    doc = page.parent
+    try:  # _parse_da is how apply_redactions itself reads the font
+        pymupdf.get_text_length("", pymupdf.TOOLS._parse_da(mark)[1])
+    except ValueError:
+        doc.xref_set_key(mark.xref, "OverlayText", "null")
+    points = mark.vertices or []
+    if len(points) < 4:  # no whole quad: MuPDF removes under the /Rect it fills
+        return
+    for i in range(0, len(points) - 3, 4):
+        piece = page.add_redact_annot(pymupdf.Quad(points[i : i + 4]).rect, cross_out=False)
+        for key in ("IC", "DA", "OverlayText", "Q"):
+            kind, value = doc.xref_get_key(mark.xref, key)
+            if kind != "null":
+                doc.xref_set_key(
+                    piece.xref, key, pymupdf.get_pdf_str(value) if kind == "string" else value
+                )
+    page.delete_annot(mark)
 
 
 def _extract_matches(
@@ -518,25 +554,45 @@ def _open_pdf(content: bytes):
 
 
 def _qpdf_page_count(content: bytes) -> int | None:
-    import pikepdf
+    """Pages qpdf finds following the page tree's kids; None when it cannot tell.
 
-    try:
-        with pikepdf.open(io.BytesIO(content)) as pdf:
-            return len(pdf.pages)
-    except Exception:
-        return None
+    In a child process: qpdf recurses down the tree, and one 40 000 levels deep
+    overflowed its stack and killed this API worker (SIGBUS) mid-request.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "in.pdf"
+        path.write_bytes(content)
+        count = "import sys, pikepdf; print(len(pikepdf.open(sys.argv[1]).pages))"
+        try:
+            result = _spawn(
+                [sys.executable, "-c", count, str(path)],
+                timeout=REPAIR_WORKER_TIMEOUT,
+                tmpdir=tmp,
+                mem_bytes=GS_REPAIR_MEM_BYTES,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+    return int(result.stdout) if result.returncode == 0 else None
 
 
 def _pages_with_content(doc) -> int:
-    """Pages whose page object and content streams survived MuPDF's repair."""
+    """Pages whose page object and content streams survived MuPDF's repair, or
+    -1 when any content reads back with a MuPDF warning: a file cut inside a
+    page's content decodes short («premature end of data»), never with an error,
+    and that page lost its last line behind a 200.
+    """
+    # ponytail: MuPDF's warning store is process-global, so this is exact while
+    # one request runs at a time (containerConcurrency 1); a lock otherwise.
+    pymupdf.TOOLS.mupdf_warnings()  # flush (a pending «repeated N times») and clear
     try:
-        return sum(
+        pages = sum(
             doc.xref_get_key(page.xref, "Type") == ("name", "/Page")
-            and all(doc.xref_is_stream(x) for x in page.get_contents())
+            and all(doc.xref_stream(x) is not None for x in page.get_contents())
             for page in doc
         )
     except Exception:
         return -1
+    return -1 if pymupdf.TOOLS.mupdf_warnings() else pages
 
 
 def _check_image_budget(doc, pages=None) -> None:
@@ -999,7 +1055,8 @@ def _ocr_megapixels(page) -> float:
     OCRmyPDF writes.
     """
     dpis, areas = [], []
-    for info in page.get_image_info():
+    images = page.get_image_info()  # every image drawn, inline ones too
+    for info in images:
         a, b, c, d = info["transform"][:4]
         shown_w, shown_h = math.hypot(a, b) / 72, math.hypot(c, d) / 72
         if info["width"] and info["height"] and shown_w and shown_h:
@@ -1020,8 +1077,9 @@ def _ocr_megapixels(page) -> float:
     )
     inches = page.mediabox.width * page.mediabox.height / 72**2
     # 1-bit images only (a B/W scan) render mono: measured at 0.28 of a colour
-    # pixel's time, so half a grey one.
-    mono = dpis and not has_vector and all(img[4] == 1 for img in page.get_images(full=True))
+    # pixel's time, so half a grey one. Read from the images drawn: get_images
+    # lists no inline image, and a page with only a colour one priced as mono.
+    mono = dpis and not has_vector and all(info["bpc"] == 1 for info in images)
     return inches * dpi**2 / 1e6 * (2 if colour else 0.5 if mono else 1)
 
 
@@ -1077,6 +1135,20 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 f"{MAX_OCR_PAGES} de cada vez. Separe-as com a ferramenta Extrair PDF, "
                 f"até {MAX_OCR_PAGES} páginas de cada vez, e processe cada parte.",
             )
+        # --redo-ocr strips invisible text from the page's own content only, and
+        # OCRmyPDF keeps its layer in a Form XObject (/OCR- + Name.random's 22
+        # characters): OCR of our own output kept the old layer and added a second
+        # copy of every word. Stripped before the budget, which priced that layer
+        # (text renders at 400 dpi) and refused OCR of our own large results; and
+        # only that name, or a user's /OCR-Logo went with it.
+        stripped = False
+        for pno in pages:
+            for xref in doc[pno - 1].get_contents():
+                old = doc.xref_stream(xref)
+                new = _re.sub(rb"/OCR-[A-Za-z0-9_-]{22}\s+Do\b", b"", old)
+                if new != old:
+                    doc.update_stream(xref, new)
+                    stripped = True
         megapixels = [_ocr_megapixels(doc[pno - 1]) for pno in pages]
         worker_budget = MAX_OCR_MEGAPIXELS / OCR_JOBS
         if max(megapixels) > worker_budget:
@@ -1105,17 +1177,6 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
         # --redo-ocr refuses a PDF with fillable form fields (exit 2); --skip-text
         # accepts it, and the pages chosen above have no real text to skip.
         mode = "--skip-text" if doc.is_form_pdf else "--redo-ocr"
-        # --redo-ocr strips invisible text from the page's own content only, and
-        # OCRmyPDF keeps its layer in a Form XObject (/OCR-…): OCR of our own
-        # output kept the old layer and added a second copy of every word.
-        stripped = False
-        for pno in pages:
-            for xref in doc[pno - 1].get_contents():
-                old = doc.xref_stream(xref)
-                new = _re.sub(rb"/OCR-[\w-]+\s+Do\b", b"", old)
-                if new != old:
-                    doc.update_stream(xref, new)
-                    stripped = True
         if stripped:
             content = doc.tobytes()
     finally:

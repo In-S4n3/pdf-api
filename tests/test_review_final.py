@@ -1,21 +1,25 @@
 """Regressions found by the audit's final review (2026-09-24), ids P1-1 … P2-5.
 
 Each test failed on b0687b4, the audit's last deploy, unless its docstring
-calls it a guard: a guard pins what the fix must not break.
+calls it a guard: a guard pins what the fix must not break. The ids A2 … F2
+come from the review of 4cca0c5; those tests failed on 46dd0c5.
 """
 
 from __future__ import annotations
 
+import binascii
 import io
 import os
 import subprocess
 import zipfile
+from pathlib import Path
 
 import pikepdf
 import pymupdf
 import pytest
 from PIL import Image, ImageCms
 
+from app.api_errors import ApiError
 from app.services import pdf_tools
 from tests._env import can_ocr, pdfa_resources_present
 from tests.test_audit_fixes import (
@@ -135,6 +139,79 @@ def test_ocr_budget_takes_six_bw_pages_at_600_dpi(client, monkeypatch):
     calls = _ocr_calls(monkeypatch)
     _post(client, "ocr", _bw_scan(6, 600), {"language": "portuguese"})
     assert calls
+
+
+def test_ocr_does_not_price_an_inline_image_page_as_black_and_white():
+    """F1: get_images does not list inline images and all([]) is True, so a page whose
+    only image is an inline colour one was priced as a 1-bit scan, at half a grey page."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((10, 10), " ")  # a content stream to overwrite
+    raw = bytes([120, 30, 200]) * (240 * 340)
+    doc.update_stream(
+        page.get_contents()[0],
+        b"q 595 0 0 842 0 0 cm BI /W 240 /H 340 /CS /RGB /BPC 8 /F /AHx ID "
+        + binascii.hexlify(raw)
+        + b"> EI Q",
+    )
+    reread = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    grey = 595 * 842 / 72**2 * (340 / (842 / 72)) ** 2 / 1e6
+    assert pdf_tools._ocr_megapixels(reread[0]) >= grey * 0.99
+
+
+_OCR_LAYER = "OCR-Kt9epu2dhSU18DPtXGjqVg"  # ocrmypdf's name: "OCR-" + Name.random()
+
+
+def _with_xobject(pdf: bytes, name: str, stream: bytes, **form) -> bytes:
+    """Every page draws a Form XObject called `name` last, as OCRmyPDF draws its layer."""
+    Name = pikepdf.Name
+    with pikepdf.open(io.BytesIO(pdf)) as doc:
+        xobject = doc.make_stream(
+            stream, Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 595, 842], **form
+        )
+        for page in doc.pages:
+            page.add_resource(xobject, Name.XObject, Name("/" + name))
+            page.contents_add(doc.make_stream(f"q /{name} Do Q".encode()))
+        buf = io.BytesIO()
+        doc.save(buf)
+    return buf.getvalue()
+
+
+def test_ocr_budgets_our_own_output_without_its_old_layer(client, monkeypatch):
+    """N1: the budget priced the old OCR layer (its invisible text renders at 400 dpi),
+    stripped only afterwards: 8 colour A4 scans OCRed once were refused «até 4 páginas»."""
+    calls = _ocr_calls(monkeypatch)
+    jpeg = io.BytesIO()
+    Image.new("RGB", (2480, 3508), (240, 235, 225)).save(jpeg, "JPEG")
+    doc = pymupdf.open()
+    for _ in range(8):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=jpeg.getvalue())
+    helvetica = pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+                                   BaseFont=pikepdf.Name.Helvetica)
+    layer = b"BT /F1 12 Tf 3 Tr 72 742 Td (assembleia) Tj ET"  # invisible text
+    pdf = _with_xobject(doc.tobytes(), _OCR_LAYER, layer,
+                        Resources=pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=helvetica)))
+    _post(client, "ocr", pdf, {"language": "portuguese"})
+    assert calls
+
+
+def test_ocr_keeps_a_user_xobject_whose_name_starts_with_ocr(client, monkeypatch):
+    """F2: the P1-2 strip took any «/OCR-… Do» for OCRmyPDF's layer, and a logo the user
+    named /OCR-Logo disappeared from the page sent to OCR."""
+    sent = []
+
+    def capture(command, **_kwargs):
+        sent.append(Path(command[-2]).read_bytes())
+        raise ApiError(503, "tool_unavailable", "stub")
+
+    monkeypatch.setattr(pdf_tools, "_run_command", capture)
+    logo = b"1 0 0 RG 5 w 10 10 180 80 re S"  # a red box, drawn on the page
+    _post(client, "ocr", _with_xobject(_scan(["Relatório anual"]), "OCR-Logo", logo),
+          {"language": "portuguese"})
+    with pymupdf.open(stream=sent[0], filetype="pdf") as ocr_input:
+        content = b"".join(ocr_input.xref_stream(x) for x in ocr_input[0].get_contents())
+    assert b"/OCR-Logo Do" in content
 
 
 # --- Redact ----------------------------------------------------------------
@@ -264,6 +341,71 @@ def test_redact_does_not_show_a_print_only_annotation(client):
         assert "COPIA" not in result[0].get_text()
 
 
+def test_redact_does_not_show_a_print_only_form_field(client):
+    """A8: P1-8 dropped NoView annotations through page.annots(), which skips form
+    fields: a print-only field was still baked into the page, on screen and in the text."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Contacto: joao@exemplo.pt", fontsize=12)
+    field = pymupdf.Widget()
+    field.field_type = pymupdf.PDF_WIDGET_TYPE_TEXT
+    field.field_name = "carimbo"
+    field.rect = pymupdf.Rect(300, 300, 500, 360)
+    field.field_value = "COPIA"
+    field.text_fontsize = 24
+    annot = page.add_widget(field)
+    print_only = pymupdf.PDF_ANNOT_IS_PRINT | pymupdf.PDF_ANNOT_IS_NO_VIEW
+    doc.xref_set_key(annot.xref, "F", str(print_only))
+    out = _post(client, "redact", doc.tobytes(), {"strategy": "email"})
+    with pymupdf.open(stream=out.content, filetype="pdf") as result:
+        pix = result[0].get_pixmap(dpi=72, clip=field.rect, colorspace=pymupdf.csGRAY)
+        assert min(pix.samples) > 128
+        assert "COPIA" not in result[0].get_text()
+
+
+@pytest.mark.parametrize("endpoint", ["redact/preview", "redact"])
+def test_a_pending_mark_with_overlay_text_in_an_unknown_font_is_applied(client, endpoint):
+    """A2: a pending mark whose /DA names a font outside the 14 base fonts (/ArialMT,
+    as other editors write it) answered 500: PyMuPDF cannot write its overlay text."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Nome: Maria Silva", fontsize=12)
+    page.insert_text((72, 130), "Contacto: maria@exemplo.pt", fontsize=12)
+    mark = page.add_redact_annot(page.search_for("Maria Silva")[0], text="REDACTED", fill=(0, 0, 0))
+    doc.xref_set_key(mark.xref, "DA", "(/ArialMT 10 Tf 1 0 0 rg)")
+    response = _post(client, endpoint, doc.tobytes(), {"strategy": "email"})
+    assert response.status_code == 200, response.json()
+    if endpoint == "redact":
+        assert "Maria Silva" not in _all_text(response.content)
+
+
+def test_a_pending_mark_over_two_lines_blacks_out_only_what_it_marks(client):
+    """A3: a mark with two QuadPoints (the end of one line, the start of the next) was
+    painted over its whole /Rect: unmarked text went black and stayed in the file."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Nome: Maria Silva Santos Pereira", fontsize=12)
+    page.insert_text((72, 120), "Morada: Rua das Flores 12, Lisboa", fontsize=12)
+    page.insert_text((72, 140), "Contacto: maria@exemplo.pt", fontsize=12)
+    marked = page.search_for("Santos Pereira")[0], page.search_for("Morada:")[0]
+    unmarked = page.search_for("Nome: Maria")[0], page.search_for("Rua das Flores 12")[0]
+    mark = page.add_redact_annot(marked[0] | marked[1], fill=(0, 0, 0))
+    h = page.rect.height  # QuadPoints are in PDF space, y up
+    quads = [
+        v for r in marked for v in (r.x0, h - r.y0, r.x1, h - r.y0, r.x0, h - r.y1, r.x1, h - r.y1)
+    ]
+    doc.xref_set_key(mark.xref, "QuadPoints", f"[{' '.join(f'{v:.2f}' for v in quads)}]")
+    response = _post(client, "redact", doc.tobytes(), {"strategy": "email"})
+    assert response.status_code == 200
+    text = _all_text(response.content)
+    assert "Santos" not in text
+    assert "Morada" not in text
+    with pymupdf.open(stream=response.content, filetype="pdf") as result:
+        for rect in unmarked:
+            pix = result[0].get_pixmap(dpi=72, clip=rect, colorspace=pymupdf.csGRAY)
+            assert sum(v < 60 for v in pix.samples) / len(pix.samples) <= 0.1
+
+
 # --- Damaged input and page counts -----------------------------------------
 
 
@@ -290,6 +432,21 @@ def test_an_object_stream_pdf_missing_only_its_xref_stream_is_processed(client):
         response = _post(client, endpoint, cut)
         assert response.status_code == 200, (endpoint, response.json())
         assert _texts(response.content) == _texts(full)
+
+
+@pytest.mark.parametrize("endpoint", ["compress", "flatten"])
+def test_an_object_stream_pdf_cut_inside_a_page_content_is_refused(client, endpoint):
+    """A5: qpdf cannot open it and every page still has a content stream, so P2-1 let
+    it through: 200, the last page 19 of its 20 lines (b0687b4: 422 damaged_pdf)."""
+    with pikepdf.open(io.BytesIO(_text_doc(4).tobytes(garbage=3, deflate=True))) as pdf:
+        buf = io.BytesIO()
+        pdf.save(buf, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    full = buf.getvalue()
+    # 40 bytes before the end of the last content stream, the object before the xref stream
+    cut = full[: full.rfind(b"endstream", 0, full.rfind(b"/Type /XRef")) - 40]
+    response = _post(client, endpoint, cut)
+    assert response.status_code == 422
+    assert _error(response)["code"] == "damaged_pdf"
 
 
 def test_an_object_stream_pdf_that_lost_page_content_is_still_refused(client):
@@ -334,6 +491,72 @@ def test_repair_does_not_report_lost_pages_for_a_wrong_count(client):
     assert response.status_code == 200
     assert response.headers["X-Repair-Status"] == "already-healthy"
     assert response.headers["X-Repair-Pages"] == "4/4"
+
+
+def _raw_pdf(objects: dict[int, bytes]) -> bytes:
+    """A PDF written object by object with a classic xref; object 1 is the catalog."""
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = {}
+    for num in sorted(objects):
+        offsets[num] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (num, objects[num])
+    size, start = max(objects) + 1, len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % size
+    for num in range(1, size):
+        out += b"%010d 00000 n \n" % offsets[num] if num in offsets else b"0000000000 65535 f \n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, start)
+    return bytes(out)
+
+
+_HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+
+
+def test_repair_reports_the_pages_lost_with_a_page_tree_node(client):
+    """A4: one of three /Pages nodes (10 of 30 pages) is gone. MuPDF's page walk raises
+    on it, the count fell to 0 instead of the /Count, and Repair sold 20 of 20 pages as
+    «already-healthy» (b0687b4: partial, 20/30)."""
+    objects = {1: b"<< /Type /Catalog /Pages 2 0 R >>", 3: _HELVETICA}
+    nodes, num = [], 4
+    for n in range(3):
+        node, kids = num, []
+        num += 1
+        for p in range(10):
+            text = b"BT /F1 12 Tf 72 700 Td (no %d pagina %d) Tj ET" % (n, p)
+            objects[num] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(text), text)
+            objects[num + 1] = (
+                b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 595 842] /Contents %d 0 R"
+                b" /Resources << /Font << /F1 3 0 R >> >> >>" % (node, num)
+            )
+            kids.append(b"%d 0 R" % (num + 1))
+            num += 2
+        objects[node] = b"<< /Type /Pages /Parent 2 0 R /Kids [%s] /Count 10 >>" % b" ".join(kids)
+        nodes.append(node)
+    root_kids = b" ".join(b"%d 0 R" % n for n in nodes)
+    objects[2] = b"<< /Type /Pages /Kids [%s] /Count 30 >>" % root_kids
+    del objects[nodes[1]]
+    response = _post(client, "pdf-repair", _raw_pdf(objects))
+    assert response.status_code == 200
+    assert response.headers["X-Repair-Status"] == "partial"
+    assert response.headers["X-Repair-Pages"] == "20/30"
+
+
+def test_the_qpdf_page_count_survives_a_page_tree_40000_levels_deep():
+    """A6: PDF/A counted pages with pikepdf inside the API process; qpdf recurses down
+    the page tree, and 40 000 levels overflowed its stack and killed the worker (SIGBUS)."""
+    depth, text = 40_000, b"BT /F1 12 Tf 72 700 Td (Contacto) Tj ET"
+    objects = {
+        1: b"<< /Type /Catalog /Pages 5 0 R >>",
+        2: _HELVETICA,
+        3: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(text), text),
+        4: b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 595 842] /Contents 3 0 R"
+        b" /Resources << /Font << /F1 2 0 R >> >> >>" % (4 + depth),
+    }
+    for k in range(5, 5 + depth):  # a chain of /Pages nodes, one kid each
+        parent = b"/Parent %d 0 R " % (k - 1) if k > 5 else b""
+        kid = k + 1 if k < 4 + depth else 4
+        objects[k] = b"<< /Type /Pages %s/Kids [%d 0 R] /Count 1 >>" % (parent, kid)
+    # Returning at all is the point: qpdf may give up (None) or count the one page.
+    assert pdf_tools._qpdf_page_count(_raw_pdf(objects)) in (None, 1)
 
 
 # --- Convert ---------------------------------------------------------------
