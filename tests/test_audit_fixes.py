@@ -617,6 +617,15 @@ def _grey_scan_page(doc, *, footer=None, drawing=False):
         page.draw_rect(pymupdf.Rect(10, 10, 40, 40), color=(0, 0, 0))
 
 
+def _inline_colour_page(doc):
+    """A 2 x 2 inch page whose only mark is an inline (BI … EI) 200 dpi RGB image."""
+    page = doc.new_page(width=144, height=144)
+    page.insert_text((10, 10), " ")  # gives the page a content stream to replace
+    hexdata = (bytes([120, 30, 200]) * 400 * 400).hex().encode()
+    image = b"BI /W 400 /H 400 /CS /RGB /BPC 8 /F /AHx ID " + hexdata + b"> EI"
+    doc.update_stream(page.get_contents()[0], b"q 144 0 0 144 0 0 cm " + image + b" Q")
+
+
 @pytest.mark.skipif(not can_ocr("eng"), reason=_NO_OCR)
 def test_ocr_megapixels_match_what_ocrmypdf_renders(tmp_path):
     """The budget is only as good as its model of OCRmyPDF: text lifts a page
@@ -628,6 +637,7 @@ def test_ocr_megapixels_match_what_ocrmypdf_renders(tmp_path):
     _grey_scan_page(doc, drawing=True)  # 400 dpi, colour
     icc_grey = doc.new_page(width=144, height=144)  # 300 dpi, ICC grey = colour
     icc_grey.insert_image(icc_grey.rect, pixmap=_grey_pixmap(600))
+    _inline_colour_page(doc)  # 200 dpi, colour: get_images lists no inline image
     source = tmp_path / "in.pdf"
     doc.save(source)
     work = tmp_path / "work"

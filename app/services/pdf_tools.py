@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 pymupdf.TOOLS.set_icc(True)
 
 MAX_PAGES = 200  # coarse guard; each tool also has a time budget below
+# Real files nest the page tree a handful of levels. qpdf walks it recursively
+# inside this process and overflowed its stack between 10 000 and 20 000 (SIGSEGV).
+MAX_PAGE_TREE_DEPTH = 1_000
+# Page-tree objects _open_pdf walks itself, at ~20 µs each; a bigger tree (a
+# 20 MB /Kids holds millions) is counted by qpdf in a child process.
+MAX_PAGE_TREE_WALK = 5_000
 TOOL_SUBPROCESS_TIMEOUT = 45
 REDACTION_SCAN_TIMEOUT_SECONDS = 40
 # In-process work (PyMuPDF/openpyxl loops) gets the same ceiling as the scan:
@@ -517,11 +524,12 @@ def _pdf_start(content: bytes) -> int:
     return start
 
 
-def _open_pdf(content: bytes):
+def _open_pdf(content: bytes, *, hidden_pages_ok: bool = False):
     """Open an uploaded PDF, or refuse it with the error every tool shares.
 
     Not a PDF / unreadable → 400 invalid_pdf; open password → 400
-    password_protected_pdf; no pages or only partly readable → 422 damaged_pdf.
+    password_protected_pdf; no pages, only partly readable, or pages MuPDF does
+    not see (unless hidden_pages_ok) → 422 damaged_pdf.
     """
     _pdf_start(content)
     try:
@@ -531,7 +539,13 @@ def _open_pdf(content: bytes):
     try:
         if doc.needs_pass:
             raise ApiError(400, "password_protected_pdf", PASSWORD_PROTECTED_MESSAGE)
-        if doc.page_count == 0:
+        try:
+            empty = doc.page_count == 0  # MuPDF refuses a /Count above its object count
+        except Exception as exc:
+            raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE) from exc
+        if not hidden_pages_ok:
+            _refuse_hidden_pages(doc, content)
+        if empty:
             if doc.is_repaired:
                 raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
             raise ApiError(400, "invalid_pdf", "O PDF não tem páginas.")
@@ -539,18 +553,56 @@ def _open_pdf(content: bytes):
             # MuPDF rebuilt a broken file. Where qpdf reads a different number
             # of pages (a truncated 60-page file: 60 vs 30) the result would be
             # half a document behind a success status. qpdf cannot open an
-            # object-stream file that lost only its xref stream: count the pages
-            # MuPDF resolved instead — never skip the check, a page may have
-            # lost its content.
+            # object-stream file that lost only its xref stream (None). And a
+            # matching count proves nothing about content: a linearized file cut
+            # inside its last page still counts every page.
             pages = _qpdf_page_count(content)
-            if pages is None:
-                pages = _pages_with_content(doc)
-            if pages != doc.page_count:
+            if pages not in (None, doc.page_count) or _pages_with_content(doc) != doc.page_count:
                 raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
     except BaseException:
         doc.close()
         raise
     return doc
+
+
+def _refuse_hidden_pages(doc, content: bytes) -> None:
+    """422 when the page tree's /Kids hold more pages than MuPDF counts.
+
+    MuPDF takes the number of pages from the tree's /Count; qpdf, Ghostscript and
+    viewers follow /Kids. /Count 3 over 4 pages hid page 4 from every tool while
+    the saved file still showed it: Censurar left its email readable. Walked
+    without recursion, each /Pages node once, a repeated kid counted each time;
+    past MAX_PAGE_TREE_WALK objects qpdf counts instead, in its own process.
+    """
+    size, limit = doc.xref_length(), doc.page_count
+    pages, walked = 0, 0
+    try:
+        kind, root = doc.xref_get_key(doc.pdf_catalog(), "Pages")
+        stack = [(int(root.split()[0]), 1)] if kind == "xref" else []
+        nodes = set()
+        while stack and pages <= limit and walked < MAX_PAGE_TREE_WALK:
+            xref, times = stack.pop()
+            walked += 1
+            if not 0 < xref < size:
+                continue
+            kind, kids = doc.xref_get_key(xref, "Kids")
+            if kind == "null":
+                # a dictionary, not a stream: what qpdf and pdf.js show as a page
+                if not doc.xref_is_stream(xref) and doc.xref_get_keys(xref):
+                    pages += times
+            elif xref not in nodes:  # a /Pages node, walked once: a cycle ends here
+                nodes.add(xref)
+                if kind == "xref":  # an indirect /Kids array
+                    kids = doc.xref_object(int(kids.split()[0]))
+                refs = Counter(m[1] for m in _re.finditer(r"(\d+) \d+ R", kids))
+                stack += [(int(kid), n) for kid, n in refs.items()]
+    except Exception:
+        return  # unreadable tree: the damaged-file checks after this decide
+    if stack and pages <= limit:  # too big to walk here
+        counted = _qpdf_page_count(content)
+        pages = limit + 1 if counted is None else counted  # cannot tell: refuse
+    if pages > limit:
+        raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
 
 
 def _qpdf_page_count(content: bytes) -> int | None:
@@ -1070,10 +1122,15 @@ def _ocr_megapixels(page) -> float:
     if not dpis or has_vector or page.get_texttrace():
         dpi = max(dpi, 400)
     # By the PDF's own colour space, as OCRmyPDF reads it: a grey scan with an
-    # ICC profile is rendered in colour.
-    colour = has_vector or any(
-        bpc > 1 and cs not in ("DeviceGray", "CalGray", "Indexed")
-        for _, _, _, _, bpc, cs, *_ in page.get_images(full=True)
+    # ICC profile is rendered in colour. get_images lists no inline image:
+    # those are read from the images drawn (an Indexed one counts 1 component).
+    colour = (
+        has_vector
+        or any(
+            bpc > 1 and cs not in ("DeviceGray", "CalGray", "Indexed")
+            for _, _, _, _, bpc, cs, *_ in page.get_images(full=True)
+        )
+        or any(info["bpc"] > 1 and info["colorspace"] >= 3 for info in images)
     )
     inches = page.mediabox.width * page.mediabox.height / 72**2
     # 1-bit images only (a B/W scan) render mono: measured at 0.28 of a colour
@@ -1245,7 +1302,8 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
 
     # Validate first: Ghostscript 10 exits 0 with one blank page for a
     # password-protected or empty upload, and runs a %!PS upload as a program.
-    doc = _open_pdf(content)
+    # Ghostscript converts every page the /Kids hold, whatever MuPDF counts (P2-2).
+    doc = _open_pdf(content, hidden_pages_ok=True)
     try:
         text_chars = [len(page.get_text().strip()) for page in doc]
         # The real pages: qpdf follows the page tree's kids, as Ghostscript does.
@@ -1426,12 +1484,39 @@ def _finish_pdfa(output: bytes, metadata: dict, level: str) -> bytes:
         return buf.getvalue()
 
 
+def _pikepdf_open(content: bytes, **kwargs):
+    """pikepdf.open, after refusing a page tree deeper than MAX_PAGE_TREE_DEPTH
+    (see there): qpdf walks it on open, to push inherited attributes down."""
+    import pikepdf
+
+    with pikepdf.open(io.BytesIO(content), inherit_page_attributes=False, **kwargs) as pdf:
+        # One level at a time, each node once, so a cycle ends.
+        level, seen = [pdf.Root.get("/Pages")], set()
+        for _ in range(MAX_PAGE_TREE_DEPTH):
+            kids = []
+            for node in level:
+                if not isinstance(node, pikepdf.Dictionary) or node.objgen in seen:
+                    continue
+                if node.is_indirect:
+                    seen.add(node.objgen)
+                if isinstance(children := node.get("/Kids"), pikepdf.Array):
+                    kids.extend(children)
+            if not kids:
+                break
+            level = kids
+        else:
+            raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
+    return pikepdf.open(io.BytesIO(content), **kwargs)
+
+
 def _open_pikepdf(content: bytes):
     import pikepdf
 
     _pdf_start(content)
     try:
-        pdf = pikepdf.open(io.BytesIO(content))
+        pdf = _pikepdf_open(content)
+    except ApiError:
+        raise
     except pikepdf.PasswordError as exc:
         raise ApiError(
             status_code=400,
@@ -1444,10 +1529,13 @@ def _open_pikepdf(content: bytes):
             code="invalid_pdf",
             message=INVALID_PDF_MESSAGE,
         ) from exc
-    # qpdf rebuilds a truncated file quietly: 30 of 60 pages, saved as if whole.
+    # qpdf rebuilds a truncated file quietly: 30 of 60 pages, saved as if whole,
+    # or every page with the last one's content cut short.
     try:
         with pymupdf.open(stream=content, filetype="pdf") as doc:
-            damaged = doc.is_repaired and doc.page_count != len(pdf.pages)
+            damaged = doc.is_repaired and (
+                doc.page_count != len(pdf.pages) or _pages_with_content(doc) != doc.page_count
+            )
     except Exception:
         damaged = False
     if damaged or len(pdf.pages) == 0:
@@ -1541,7 +1629,7 @@ def _open_for_unlock(content: bytes, password: str):
 
     _pdf_start(content)  # a PNG was told «A cifra pode não ser suportada»
     try:
-        return pikepdf.open(io.BytesIO(content))  # no password first
+        return _pikepdf_open(content)  # no password first
     except pikepdf.PasswordError:
         pass  # needs a real open password — fall through
     except pikepdf.PdfError as exc:
@@ -1554,7 +1642,7 @@ def _open_for_unlock(content: bytes, password: str):
             message="Este PDF precisa de uma palavra-passe para abrir.",
         )
     try:
-        return pikepdf.open(io.BytesIO(content), password=password)  # fresh buffer
+        return _pikepdf_open(content, password=password)
     except pikepdf.PasswordError as exc:
         raise ApiError(
             status_code=400,

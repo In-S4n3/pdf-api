@@ -449,6 +449,22 @@ def test_an_object_stream_pdf_cut_inside_a_page_content_is_refused(client, endpo
     assert _error(response)["code"] == "damaged_pdf"
 
 
+@pytest.mark.parametrize("endpoint", ["compress", "flatten", "protect"])
+def test_a_linearized_pdf_cut_inside_its_last_page_content_is_refused(client, endpoint):
+    """qpdf still counts the 8 pages of a linearized file cut inside the last page's
+    content; the counts matched, the content was never read, and page 8 came back
+    with lines missing behind a 200."""
+    with pikepdf.open(io.BytesIO(_text_doc(8).tobytes(garbage=3, deflate=True))) as pdf:
+        buf = io.BytesIO()
+        pdf.save(buf, object_stream_mode=pikepdf.ObjectStreamMode.generate, linearize=True)
+    full = buf.getvalue()
+    cut = full[: full.rfind(b"endstream", 0, full.rfind(b"/Type /XRef")) - 40]
+    options = {"userPassword": "x"} if endpoint == "protect" else None
+    response = _post(client, endpoint, cut, options)
+    assert response.status_code == 422
+    assert _error(response)["code"] == "damaged_pdf"
+
+
 def test_an_object_stream_pdf_that_lost_page_content_is_still_refused(client):
     """P2-1 guard: qpdf cannot open it either, but a page lost its content stream —
     ENGINE-14 still refuses it rather than return a page with its content missing."""
@@ -465,6 +481,42 @@ def _count_mismatch(count: int) -> bytes:
     raw = _text_doc(4).tobytes(garbage=0, deflate=False, use_objstms=False)
     assert raw.count(b"/Count 4") == 1
     return raw.replace(b"/Count 4", f"/Count {count}".encode())
+
+
+_MUPDF_TOOLS = [
+    ("redact/preview", {"strategy": "email"}),
+    ("redact", {"strategy": "email"}),
+    ("compress", None),
+    ("flatten", None),
+    ("pdf-to-image", {"format": "png", "pages": "all"}),
+    ("pdf-to-word", None),
+]
+
+
+@pytest.mark.parametrize(("endpoint", "options"), _MUPDF_TOOLS)
+def test_a_page_the_tree_count_leaves_out_is_refused(client, endpoint, options):
+    """/Count 3 over 4 pages: MuPDF saw 3, viewers show 4, and Censurar left page 4's
+    email readable in a file whose preview never listed it."""
+    response = _post(client, endpoint, _count_mismatch(3), options)
+    assert response.status_code == 422
+    assert _error(response)["code"] == "damaged_pdf"
+
+
+def test_a_page_tree_too_big_to_walk_is_counted_by_qpdf(client, monkeypatch):
+    """Past MAX_PAGE_TREE_WALK objects qpdf counts the /Kids, in its own process."""
+    monkeypatch.setattr(pdf_tools, "MAX_PAGE_TREE_WALK", 2)
+    assert _post(client, "flatten", _count_mismatch(4)).status_code == 200
+    response = _post(client, "flatten", _count_mismatch(3))
+    assert response.status_code == 422
+    assert _error(response)["code"] == "damaged_pdf"
+
+
+def test_a_tree_count_above_the_objects_is_refused_not_a_500(client):
+    """/Count 1 000 000 over 4 pages: MuPDF refuses a /Count above its object count,
+    and the RuntimeError from page_count escaped as a 500."""
+    response = _post(client, "compress", _count_mismatch(1_000_000))
+    assert response.status_code == 422
+    assert _error(response)["code"] == "damaged_pdf"
 
 
 def test_pdf_to_image_zip_survives_a_page_tree_count_above_its_pages(client):
@@ -540,10 +592,9 @@ def test_repair_reports_the_pages_lost_with_a_page_tree_node(client):
     assert response.headers["X-Repair-Pages"] == "20/30"
 
 
-def test_the_qpdf_page_count_survives_a_page_tree_40000_levels_deep():
-    """A6: PDF/A counted pages with pikepdf inside the API process; qpdf recurses down
-    the page tree, and 40 000 levels overflowed its stack and killed the worker (SIGBUS)."""
-    depth, text = 40_000, b"BT /F1 12 Tf 72 700 Td (Contacto) Tj ET"
+def _deep_chain(depth: int) -> bytes:
+    """One page under a chain of `depth` /Pages nodes, one kid each."""
+    text = b"BT /F1 12 Tf 72 700 Td (Contacto) Tj ET"
     objects = {
         1: b"<< /Type /Catalog /Pages 5 0 R >>",
         2: _HELVETICA,
@@ -555,8 +606,27 @@ def test_the_qpdf_page_count_survives_a_page_tree_40000_levels_deep():
         parent = b"/Parent %d 0 R " % (k - 1) if k > 5 else b""
         kid = k + 1 if k < 4 + depth else 4
         objects[k] = b"<< /Type /Pages %s/Kids [%d 0 R] /Count 1 >>" % (parent, kid)
+    return _raw_pdf(objects)
+
+
+def test_the_qpdf_page_count_survives_a_page_tree_40000_levels_deep():
+    """A6: PDF/A counted pages with pikepdf inside the API process; qpdf recurses down
+    the page tree, and 40 000 levels overflowed its stack and killed the worker (SIGBUS)."""
     # Returning at all is the point: qpdf may give up (None) or count the one page.
-    assert pdf_tools._qpdf_page_count(_raw_pdf(objects)) in (None, 1)
+    assert pdf_tools._qpdf_page_count(_deep_chain(40_000)) in (None, 1)
+
+
+@pytest.mark.parametrize("endpoint", ["protect", "pdf-unlock"])
+def test_protect_and_unlock_refuse_a_page_tree_40000_levels_deep(client, endpoint):
+    """Both open the upload with pikepdf inside the API process: 20 000 levels
+    overflowed qpdf's recursive page walk and killed the worker (SIGSEGV)."""
+    pdf, options = _deep_chain(40_000), {"userPassword": "x"}
+    if endpoint == "pdf-unlock":  # owner-only encryption, as Unlock expects
+        doc = pymupdf.open(stream=pdf, filetype="pdf")
+        pdf, options = doc.tobytes(encryption=pymupdf.PDF_ENCRYPT_AES_256, owner_pw="o"), {}
+    response = _post(client, endpoint, pdf, options)
+    assert response.status_code == 422
+    assert _error(response)["code"] == "damaged_pdf"
 
 
 # --- Convert ---------------------------------------------------------------
