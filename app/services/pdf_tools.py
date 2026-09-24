@@ -311,6 +311,9 @@ def _iter_matches(
             for annot in [a for a in page.annots() if a.flags & pymupdf.PDF_ANNOT_IS_NO_VIEW]:
                 page.delete_annot(annot)
             if next(page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)), None) is not None:
+                # Applying the mark decodes the images under it: budget first, or a
+                # 32 KB file peaks at 605 MiB, in a preview that costs no free use.
+                _check_image_budget(doc, pages=[page.number])
                 jpeg_boxes = _jpeg_image_boxes(page)
                 page.apply_redactions(
                     images=pymupdf.PDF_REDACT_IMAGE_PIXELS,

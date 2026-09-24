@@ -225,6 +225,28 @@ def test_redact_keeps_a_jpeg_scan_a_jpeg_under_a_pending_mark(client):
     assert len(out.content) < 2 * len(pdf)
 
 
+@pytest.mark.parametrize("endpoint", ["redact/preview", "redact"])
+def test_a_pending_mark_does_not_decode_an_image_over_the_budget(client, monkeypatch, endpoint):
+    """A1: 4cca0c5 applied a pending mark, decoding the image under it, before any
+    budget check. A 32 KB PDF peaked at 605 MiB, and the preview costs no free use."""
+    monkeypatch.setattr(pdf_tools, "MAX_IMAGE_PIXELS", 100 * 100)
+    applied = []
+    real_apply = pymupdf.Page.apply_redactions
+    monkeypatch.setattr(
+        pymupdf.Page, "apply_redactions", lambda *a, **k: applied.append(1) or real_apply(*a, **k)
+    )
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Contacto: joao@exemplo.pt", fontsize=12)
+    image = pymupdf.Pixmap(pymupdf.csGRAY, (0, 0, 200, 200))
+    page.insert_image(pymupdf.Rect(100, 300, 300, 500), pixmap=image)
+    page.add_redact_annot(pymupdf.Rect(150, 350, 250, 450))
+    response = _post(client, endpoint, doc.tobytes(), {"strategy": "email"})
+    assert response.status_code == 422
+    assert _error(response)["code"] == "image_too_large"
+    assert not applied
+
+
 def test_redact_does_not_show_a_print_only_annotation(client):
     """P1-8: bake() drew a NoView (print-only) stamp into the page, on screen and in the
     text."""
