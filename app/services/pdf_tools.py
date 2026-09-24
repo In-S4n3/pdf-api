@@ -165,16 +165,17 @@ EMAIL_PATTERN = r"\b[\w.%+\-]+@[\w.\-]+\.[^\W\d_]{2,}\b"
 # a longer figure on either side («1 234 567,89», an IBAN group).
 _PHONE_SEP = r"[ \u00a0-]"
 PHONE_PATTERN = (
-    r"(?<![\w@+/.,-])(?<!\d[ \u00a0])"
+    r"(?<![\w@+/,-])(?<![\d.]\.)(?<!\d[ \u00a0])"  # «Tel.912…» may start a match
     r"(?:"
     # +351 912 345 678 · 00351912345678 · (+351) 21 234 5678 · +55 (11) 91234-5678
-    r"\(?(?:\+|00)(?=(?:[ \u00a0()-]*\d){8})[1-9]\d{0,2}\)?"
+    r"\(?(?:\+|00[ \u00a0]?)(?=(?:[ \u00a0()-]*\d){8})[1-9]\d{0,2}\)?"
     rf"(?:{_PHONE_SEP}?\(\d{{1,4}}\){_PHONE_SEP}?\d{{2,5}}(?:{_PHONE_SEP}?\d{{2,5}}){{1,3}}"
-    rf"|(?:{_PHONE_SEP}?\d{{1,5}})(?:{_PHONE_SEP}?\d{{2,5}}){{2,4}})"
-    r"|\(\d{2,3}\)[ \u00a0]?\d{4,5}-?\d{4}"  # BR: (11) 91234-5678
-    r"|\d{2}[ \u00a0]\d{4,5}-\d{4}"  # BR: 11 91234-5678
-    r"|[29]\d{2}(?:[ \u00a0]?\d{3}){2}"  # PT: 912 345 678 · 212345678
-    r"|2\d[ \u00a0]\d{3}[ \u00a0]\d{4}"  # PT: 21 234 5678
+    rf"|(?:{_PHONE_SEP}?\d{{1,5}}){{1,2}}(?:{_PHONE_SEP}?\d{{2,5}}){{2,4}})"
+    r"|\(\d{2,3}\)[ \u00a0]?(?:9[ \u00a0])?\d{4,5}[ \u00a0-]?\d{4}"  # BR: (11) 9 1234-5678
+    r"|\d{2}[ \u00a0](?:9[ \u00a0])?\d{4,5}[ \u00a0-]\d{4}|\d{2}[ \u00a0]9\d{8}|9\d{4}-\d{4}"  # BR
+    rf"|[29]\d{{2}}(?:{_PHONE_SEP}?\d{{3}}){{2}}|2\d{_PHONE_SEP}\d{{3}}{_PHONE_SEP}\d{{4}}"  # PT
+    rf"|[29]\d{_PHONE_SEP}\d{{3}}(?:{_PHONE_SEP}\d{{2}}){{2}}|[29]\d{{2}}(?:{_PHONE_SEP}\d{{2}}){{3}}"
+    r"|0[3589]00[ \u00a0]?\d{3}[ \u00a0]?\d{4}"  # BR: 0800 123 4567
     r"|(?:80[08]|70[78]|76[01])(?:[ \u00a0]?\d{3}){2}"  # PT: 800 200 200
     r")"
     r"(?![\w@/]|[.,-]?\d|[ \u00a0]\d)"
@@ -301,6 +302,23 @@ def _iter_matches(
     # survived in a note's /Contents and in a field's appearance stream. Baking
     # turns every annotation and widget appearance into page content (a note's
     # hidden /Contents is dropped), so preview, ids and removal see one text.
+    # Two kinds are not baked: a print-only (NoView) mark would show on screen,
+    # and a /Redact mark another editor left pending means "remove this" — baked,
+    # it became an outline over text that stays readable.
+    pymupdf.TOOLS.set_small_glyph_heights(True)
+    try:
+        for page in doc:
+            for annot in [a for a in page.annots() if a.flags & pymupdf.PDF_ANNOT_IS_NO_VIEW]:
+                page.delete_annot(annot)
+            if next(page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)), None) is not None:
+                jpeg_boxes = _jpeg_image_boxes(page)
+                page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                )
+                _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
+    finally:
+        pymupdf.TOOLS.set_small_glyph_heights(False)
     doc.bake(annots=True, widgets=True)
 
     seen_ids: set[str] = set()
@@ -478,11 +496,18 @@ def _open_pdf(content: bytes):
             if doc.is_repaired:
                 raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
             raise ApiError(400, "invalid_pdf", "O PDF não tem páginas.")
-        if doc.is_repaired and _qpdf_page_count(content) != doc.page_count:
+        if doc.is_repaired:
             # MuPDF rebuilt a broken file. Where qpdf reads a different number
             # of pages (a truncated 60-page file: 60 vs 30) the result would be
-            # half a document behind a success status.
-            raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
+            # half a document behind a success status. qpdf cannot open an
+            # object-stream file that lost only its xref stream: count the pages
+            # MuPDF resolved instead — never skip the check, a page may have
+            # lost its content.
+            pages = _qpdf_page_count(content)
+            if pages is None:
+                pages = _pages_with_content(doc)
+            if pages != doc.page_count:
+                raise ApiError(422, "damaged_pdf", DAMAGED_PDF_MESSAGE)
     except BaseException:
         doc.close()
         raise
@@ -499,10 +524,24 @@ def _qpdf_page_count(content: bytes) -> int | None:
         return None
 
 
+def _pages_with_content(doc) -> int:
+    """Pages whose page object and content streams survived MuPDF's repair."""
+    try:
+        return sum(
+            doc.xref_get_key(page.xref, "Type") == ("name", "/Page")
+            and all(doc.xref_is_stream(x) for x in page.get_contents())
+            for page in doc
+        )
+    except Exception:
+        return -1
+
+
 def _check_image_budget(doc, pages=None) -> None:
     """Refuse an embedded image too large to decode safely (see MAX_IMAGE_PIXELS)."""
-    for pno in range(doc.page_count) if pages is None else pages:
-        for img in doc[pno].get_images(full=True):
+    # Walk the pages, not range(page_count): that is the tree's /Count, which can
+    # be wrong (6 over 4 real pages indexed page 5 and answered 500).
+    for page in doc if pages is None else (doc[pno] for pno in pages):
+        for img in page.get_images(full=True):
             width, height = img[2], img[3]
             if width * height > MAX_IMAGE_PIXELS:
                 raise ApiError(
@@ -724,6 +763,8 @@ def _sanitize_image(content: bytes) -> bytes:
 
     fmt = img.format
     dpi = img.info.get("dpi")
+    if dpi and max(dpi) <= 1:
+        dpi = None  # Pillow's stand-in for "no resolution"; img2pdf then uses its 96 dpi
     # MPO (phone JPEG) frames past the first are previews/depth maps, not pages.
     # exif_transpose returns a copy, taken while the iterator sits on that frame.
     source = [img] if fmt in ("JPEG", "MPO") else ImageSequence.Iterator(img)
@@ -802,6 +843,14 @@ def convert_to_pdf(content: bytes, content_type: str | None, filename: str | Non
     """
     declared = _resolve_convert_content_type(content_type, filename)
     actual = _sniff_convert_type(content)
+    if actual is None and declared in IMAGE_MIMES:
+        # A WebP saved as .jpg (sites serve them under .jpg URLs) opens in every
+        # viewer, and img2pdf reads it: convert it rather than call it damaged.
+        from PIL import Image
+
+        with suppress(Exception):
+            if Image.open(io.BytesIO(content)).format in ("WEBP", "GIF", "BMP"):
+                actual = declared
     if actual is None:
         if declared is None:
             raise ApiError(415, "unsupported_media_type", UNSUPPORTED_FORMAT_MESSAGE)
@@ -939,19 +988,25 @@ def _ocr_megapixels(page) -> float:
     """Megapixels OCRmyPDF will render for this page, colour counted twice.
 
     Mirrors ocrmypdf 17 (_pipeline.get_page_square_dpi, rasterize): the page
-    renders at its images' highest resolution, at 400 dpi or more when it has
-    any text (invisible too) or vector painting, and in colour when an image is
-    colour or anything is painted. test_ocr_megapixels_match_what_ocrmypdf_renders
-    pins it against the PNG OCRmyPDF writes.
+    renders at its images' highest resolution (at their area-weighted one when
+    that is under 0.8 of it: a small signature on a scan), at 400 dpi or more
+    when it has any text (invisible too) or vector painting, and in colour when
+    an image is colour or anything is painted.
+    test_ocr_megapixels_match_what_ocrmypdf_renders pins it against the PNG
+    OCRmyPDF writes.
     """
-    dpis = []
+    dpis, areas = [], []
     for info in page.get_image_info():
         a, b, c, d = info["transform"][:4]
         shown_w, shown_h = math.hypot(a, b) / 72, math.hypot(c, d) / 72
         if info["width"] and info["height"] and shown_w and shown_h:
             dpis.append(max(info["width"] / shown_w, info["height"] / shown_h))
+            areas.append(shown_w * shown_h)
     has_vector = bool(page.get_cdrawings())  # annotations count too: errs heavy
     dpi = max(dpis, default=0)
+    if dpis:  # _pipeline.calculate_image_dpi: the area-weighted (harmonic) dpi
+        weighted = sum(areas) / sum(a / d for a, d in zip(areas, dpis, strict=True))
+        dpi = weighted if weighted < 0.8 * dpi else dpi
     if not dpis or has_vector or page.get_texttrace():
         dpi = max(dpi, 400)
     # By the PDF's own colour space, as OCRmyPDF reads it: a grey scan with an
@@ -961,7 +1016,10 @@ def _ocr_megapixels(page) -> float:
         for _, _, _, _, bpc, cs, *_ in page.get_images(full=True)
     )
     inches = page.mediabox.width * page.mediabox.height / 72**2
-    return inches * dpi**2 / 1e6 * (2 if colour else 1)
+    # 1-bit images only (a B/W scan) render mono: measured at 0.28 of a colour
+    # pixel's time, so half a grey one.
+    mono = dpis and not has_vector and all(img[4] == 1 for img in page.get_images(full=True))
+    return inches * dpi**2 / 1e6 * (2 if colour else 0.5 if mono else 1)
 
 
 def _busiest_ocr_worker(megapixels: list[float]) -> float:
@@ -1016,12 +1074,6 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 f"{MAX_OCR_PAGES} de cada vez. Separe-as com a ferramenta Extrair PDF, "
                 f"até {MAX_OCR_PAGES} páginas de cada vez, e processe cada parte.",
             )
-        if any(abs(doc[pno - 1].rect) * (300 / 72) ** 2 > MAX_RENDER_PIXELS for pno in pages):
-            raise ApiError(
-                422,
-                "page_too_large",
-                "Este PDF tem páginas demasiado grandes para OCR (o máximo é A2).",
-            )
         megapixels = [_ocr_megapixels(doc[pno - 1]) for pno in pages]
         worker_budget = MAX_OCR_MEGAPIXELS / OCR_JOBS
         if max(megapixels) > worker_budget:
@@ -1050,6 +1102,19 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
         # --redo-ocr refuses a PDF with fillable form fields (exit 2); --skip-text
         # accepts it, and the pages chosen above have no real text to skip.
         mode = "--skip-text" if doc.is_form_pdf else "--redo-ocr"
+        # --redo-ocr strips invisible text from the page's own content only, and
+        # OCRmyPDF keeps its layer in a Form XObject (/OCR-…): OCR of our own
+        # output kept the old layer and added a second copy of every word.
+        stripped = False
+        for pno in pages:
+            for xref in doc[pno - 1].get_contents():
+                old = doc.xref_stream(xref)
+                new = _re.sub(rb"/OCR-[\w-]+\s+Do\b", b"", old)
+                if new != old:
+                    doc.update_stream(xref, new)
+                    stripped = True
+        if stripped:
+            content = doc.tobytes()
     finally:
         doc.close()
 
@@ -1118,8 +1183,10 @@ def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
     # password-protected or empty upload, and runs a %!PS upload as a program.
     doc = _open_pdf(content)
     try:
-        page_count = doc.page_count
         text_chars = [len(page.get_text().strip()) for page in doc]
+        # The real pages: qpdf follows the page tree's kids, as Ghostscript does.
+        # MuPDF's page_count is the tree's /Count, which can be wrong either way.
+        page_count = _qpdf_page_count(content) or len(text_chars)
         metadata = doc.metadata or {}
         source = _prepare_for_pdfa(doc, pdfa_level)
     finally:
@@ -1228,7 +1295,7 @@ def _check_pdfa_output(output: bytes, page_count: int, text_chars: list[int], le
                 "Não foi possível converter todas as páginas deste PDF para PDF/A.",
             )
         if level == "1":
-            for before, page in zip(text_chars, out, strict=True):
+            for before, page in zip(text_chars, out, strict=False):  # /Count may be wrong
                 # PDF/A-1 has no transparency: gs turns such a page into one
                 # picture, so its text can no longer be searched or copied.
                 if before >= 20 and len(page.get_text().strip()) < before // 10:

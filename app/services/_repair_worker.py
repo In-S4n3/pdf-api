@@ -46,16 +46,18 @@ _CONTENT_DAMAGE = ("treating", "unknown token", "decoding stream", "unexpected")
 
 
 def _mupdf_page_count(content: bytes) -> int:
-    """Pages the document declares, as MuPDF reads it (0 when unreadable).
+    """Pages MuPDF walks in the document (0 when unreadable).
 
     qpdf rebuilds a truncated file's page tree from what survives, so a
-    60-page file cut in half read as 30 of 30 — "all pages recovered".
+    60-page file cut in half read as 30 of 30 — "all pages recovered". Walked,
+    not page_count: that is the tree's /Count, and a /Count of 6 over 4 intact
+    pages read as "4 of 6 recovered".
     """
     try:
         import pymupdf
 
         with pymupdf.open(stream=content, filetype="pdf") as doc:
-            return doc.page_count
+            return sum(1 for _ in doc)
     except Exception:
         return 0
 

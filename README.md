@@ -57,9 +57,9 @@ V1, `/v2/echo` and `/v2/fill-form` stay mounted on purpose (decision of
   refused before the body is read. Responses stop at 30 MiB (`output_too_large`):
   Cloud Run drops a non-streamed HTTP/1 response above 32 MiB.
 - OCR: at most 8 pages that need OCR per job, and at most 150 megapixels as
-  OCRmyPDF will render them — colour counts twice, and any page with text or a
-  drawing renders at 400 dpi. It runs 4 pages at a time, one per vCPU, so each
-  worker gets at most 37.5 Mpx. On Cloud Run gen2 with 4 vCPU, 8 colour A4 scans
+  OCRmyPDF will render them — colour counts twice, a black-and-white (1-bit)
+  scan half, and any page with text or a drawing renders at 400 dpi. It runs 4
+  pages at a time, one per vCPU, so each worker gets at most 37.5 Mpx. On Cloud Run gen2 with 4 vCPU, 8 colour A4 scans
   at 300 dpi (139 Mpx) take 28.5 s, 4 A4 photos with captions (124) ~40 s, and
   8 A4 photos at 300 dpi sit at the 45 s tool budget. Too many pages answer
   `too_many_pages` with the number that fits; one page above 37.5 Mpx (an A3
