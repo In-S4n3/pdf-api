@@ -4,6 +4,7 @@ import io
 import shutil
 import zipfile
 
+import pymupdf
 import pytest
 from PIL import Image
 
@@ -202,6 +203,46 @@ def test_convert_jpg_returns_pdf(client):
     )
     assert response.status_code == 200
     assert response.content[:5] == b"%PDF-"
+
+
+def test_convert_large_jpg_uses_landscape_a4(client):
+    buf = io.BytesIO()
+    Image.new("RGB", (4032, 3024), "white").save(buf, format="JPEG", dpi=(72, 72))
+
+    response = client.post(
+        "/convert",
+        files={"file": ("photo.jpg", io.BytesIO(buf.getvalue()), "image/jpeg")},
+        data={"options": "{}"},
+    )
+
+    assert response.status_code == 200
+    with pymupdf.open(stream=response.content, filetype="pdf") as doc:
+        page = doc[0]
+        assert page.rect.width == pytest.approx(841.89, abs=1)
+        assert page.rect.height == pytest.approx(595.28, abs=1)
+        image_rect = page.get_image_rects(page.get_images()[0][0])[0]
+        assert image_rect.width <= page.rect.width
+        assert image_rect.height <= page.rect.height
+
+
+def test_convert_small_jpg_is_not_upscaled(client):
+    buf = io.BytesIO()
+    Image.new("RGB", (50, 100), "white").save(buf, format="JPEG", dpi=(72, 72))
+
+    response = client.post(
+        "/convert",
+        files={"file": ("small.jpg", io.BytesIO(buf.getvalue()), "image/jpeg")},
+        data={"options": "{}"},
+    )
+
+    assert response.status_code == 200
+    with pymupdf.open(stream=response.content, filetype="pdf") as doc:
+        page = doc[0]
+        assert page.rect.width == pytest.approx(595.28, abs=1)
+        assert page.rect.height == pytest.approx(841.89, abs=1)
+        image_rect = page.get_image_rects(page.get_images()[0][0])[0]
+        assert image_rect.width <= 51
+        assert image_rect.height <= 101
 
 
 def test_convert_png_returns_pdf(client):

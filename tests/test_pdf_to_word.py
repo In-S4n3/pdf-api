@@ -1,13 +1,18 @@
 """Tests for the pdf_to_docx service (PDF -> editable .docx)."""
 
 import io
+import logging
+import subprocess
 import zipfile
 from pathlib import Path
 
 import pymupdf
 import pytest
+from pdf2docx.converter import Converter
+from pdf2docx.page.Page import Page
 
 from app.api_errors import ApiError
+from app.services import pdf_tools
 from app.services.pdf_tools import _docx_is_effectively_empty, pdf_to_docx
 
 
@@ -46,6 +51,34 @@ def test_text_pdf_returns_valid_docx():
         assert "word/document.xml" in names
         document_xml = zf.read("word/document.xml").decode("utf-8", "replace")
     assert "12345" in document_xml
+
+
+def test_page_parse_failure_refuses_incomplete_word(monkeypatch, caplog):
+    original_parse = Page.parse
+
+    def fail_second_page(self, **kwargs):
+        if self.id == 1:
+            raise ValueError("simulated page failure")
+        return original_parse(self, **kwargs)
+
+    def convert_in_process(command, *, timeout, tmpdir):
+        converter = Converter(command[2])
+        try:
+            with caplog.at_level(logging.ERROR):
+                converter.convert(command[3])
+        finally:
+            converter.close()
+        errors = "\n".join(record.getMessage() for record in caplog.records)
+        return subprocess.CompletedProcess(command, 0, "", errors)
+
+    monkeypatch.setattr(Page, "parse", fail_second_page)
+    monkeypatch.setattr(pdf_tools, "_run_command", convert_in_process)
+    with pytest.raises(ApiError) as exc:
+        pdf_to_docx(_text_pdf(pages=3))
+    assert exc.value.status_code == 422
+    assert exc.value.code == "conversion_incomplete"
+    assert "2" in exc.value.message
+    assert "Extrair PDF" in exc.value.message
 
 
 def test_scanned_pdf_raises_422():

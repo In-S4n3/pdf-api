@@ -105,6 +105,15 @@ def test_cells_cap_trips_pdf_too_complex(monkeypatch):
     assert exc.value.code == "pdf_too_complex"
 
 
+def test_tables_cap_refuses_incomplete_excel(monkeypatch):
+    monkeypatch.setattr(pdf_tools, "MAX_TABLES", 2)
+    with pytest.raises(ApiError) as exc:
+        pdf_to_xlsx(g.three_tables_pdf())
+    assert exc.value.status_code == 422
+    assert exc.value.code == "too_many_tables"
+    assert "Dividir PDF" in exc.value.message
+
+
 # --- regression guard: sparse legit table must NOT be pre-rejected ----------
 
 
