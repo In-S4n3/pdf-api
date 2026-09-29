@@ -691,15 +691,15 @@ def test_protect_and_unlock_refuse_a_page_tree_40000_levels_deep(client, endpoin
 
 
 def test_convert_an_icc_tiff_without_resolution_keeps_a_normal_page(client):
-    """P2-4: Pillow reads a TIFF without resolution tags as 1 dpi; re-saved without the ICC
-    profile, img2pdf honoured it and made a page 1 200 inches wide."""
+    """P2-4: TIFF without resolution tags stays A4 after its ICC profile is removed."""
     icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
     buf = io.BytesIO()
     Image.new("RGB", (1200, 900), "red").save(buf, format="TIFF", icc_profile=icc)
     response = _post(client, "convert", buf.getvalue(), name="x.tif", mime="image/tiff")
     assert response.status_code == 200
     with pymupdf.open(stream=response.content, filetype="pdf") as doc:
-        assert round(doc[0].rect.width) == 900  # 1 200 px at img2pdf's 96 dpi, as without ICC
+        assert round(doc[0].rect.width) == 842
+        assert round(doc[0].rect.height) == 595
 
 
 @pytest.mark.parametrize(

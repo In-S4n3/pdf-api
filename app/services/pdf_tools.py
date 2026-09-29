@@ -928,13 +928,18 @@ def _reencode_frames(content: bytes) -> list[bytes]:
 def _image_to_pdf(content: bytes) -> bytes:
     from PIL import Image
 
+    layout = img2pdf.get_layout_fun(
+        pagesize=(img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297)),
+        fit=img2pdf.FitMode.shrink,
+        auto_orient=True,
+    )
     try:
         try:
-            return img2pdf.convert(_sanitize_image(content))
+            return img2pdf.convert(_sanitize_image(content), layout_fun=layout)
         except Image.DecompressionBombError:
             raise
         except Exception:
-            return img2pdf.convert(_reencode_frames(content))
+            return img2pdf.convert(_reencode_frames(content), layout_fun=layout)
     except Image.DecompressionBombError as exc:
         raise ApiError(
             422, "image_too_large", "Esta imagem é demasiado grande para converter em segurança."
@@ -1188,6 +1193,19 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 "Este PDF já tem texto selecionável em todas as páginas: "
                 "não há nada para reconhecer.",
             )
+        form_pdf = bool(doc.is_form_pdf)
+        if form_pdf and any(
+            pymupdf.TextPage(doc[pno - 1].get_displaylist(annots=0).get_textpage())
+            .extractText()
+            .strip()
+            for pno in pages
+        ):
+            raise ApiError(
+                422,
+                "form_needs_flattening",
+                "Este PDF tem campos de formulário. Use «Achatar PDF» primeiro e "
+                "depois volte a fazer OCR ao ficheiro achatado.",
+            )
         if len(pages) > MAX_OCR_PAGES:
             raise ApiError(
                 422,
@@ -1235,9 +1253,7 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
             )
         _check_image_budget(doc, pages=[pno - 1 for pno in pages])
         all_pages = len(pages) == doc.page_count
-        # --redo-ocr refuses a PDF with fillable form fields (exit 2); --skip-text
-        # accepts it, and the pages chosen above have no real text to skip.
-        mode = "--skip-text" if doc.is_form_pdf else "--redo-ocr"
+        mode = "--skip-text" if form_pdf else "--redo-ocr"
         if stripped:
             content = doc.tobytes()
     finally:
@@ -1278,7 +1294,23 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 message="Falha no processamento OCR.",
             )
 
-        return output_path.read_bytes()
+        output = output_path.read_bytes()
+        with pymupdf.open(stream=output, filetype="pdf") as result_doc:
+            found_text = False
+            for pno in pages:
+                page = result_doc[pno - 1]
+                if page.get_text().strip() and any(
+                    span["type"] == 3 and span["chars"] for span in page.get_texttrace()
+                ):
+                    found_text = True
+                    break
+        if not found_text:
+            raise ApiError(
+                422,
+                "ocr_no_text",
+                "O OCR não encontrou texto para reconhecer nas imagens deste PDF.",
+            )
+        return output
 
 
 def convert_pdf_to_pdfa(content: bytes, conformance: str) -> bytes:
@@ -1828,10 +1860,9 @@ def redact_pdf(
     confirmed_ids: list[str] | None = None,
 ) -> bytes:
     """Apply PII redaction. If confirmed_ids is None, redact every match.
-    If it is a list, redact the listed matches (unknown ids are skipped — the
-    user's preview saw a set; we trust intent) plus every match past the
-    preview's PREVIEW_MATCH_CAP, which the user never saw and so could not
-    have deselected: 200 of 5 200 emails used to survive "redaction".
+    If it is a list, refuse unknown ids, then redact the listed matches plus
+    every match past PREVIEW_MATCH_CAP. The user never saw those, so could not
+    have deselected them: 200 of 5 200 emails used to survive "redaction".
 
     Covered image pixels are blanked too: on a scan with an OCR layer the box
     used to hide the text layer only, and the email stayed readable in the
@@ -1851,6 +1882,13 @@ def redact_pdf(
 
             if confirmed_ids is not None:
                 confirmed_set = set(confirmed_ids)
+                if confirmed_set - {m.id for m in all_matches}:
+                    raise ApiError(
+                        409,
+                        "preview_stale",
+                        "A pré-visualização já não corresponde a este PDF. "
+                        "Faça uma nova pré-visualização e confirme novamente os dados a censurar.",
+                    )
                 matches_to_apply = [
                     m
                     for index, m in enumerate(all_matches)
@@ -2078,6 +2116,24 @@ def pdf_to_docx(content: bytes) -> bytes:
             timeout=TOOL_SUBPROCESS_TIMEOUT,
             tmpdir=tmpdir,
         )
+        skipped = sorted(
+            {
+                int(page)
+                for page in _re.findall(
+                    r"Ignore page (\d+) due to (?:parsing|making) page error:", result.stderr
+                )
+            }
+        )
+        if skipped:
+            pages = ", ".join(map(str, skipped))
+            location = f"na página {pages}" if len(skipped) == 1 else f"nas páginas {pages}"
+            raise ApiError(
+                422,
+                "conversion_incomplete",
+                f"Falhou a conversão para Word {location}. "
+                "Reveja as páginas indicadas. Use «Extrair PDF» para selecionar "
+                "as restantes e convertê-las em separado.",
+            )
         if result.returncode != 0 or not output_path.exists():
             logger.error("pdf2docx failed: %s", _trim_process_output(result.stderr))
             raise ApiError(
@@ -2208,6 +2264,14 @@ def pdf_to_xlsx(content: bytes) -> bytes:
                 rows = tab.extract()
                 if not rows:
                     continue
+                n_tables += 1
+                if n_tables > MAX_TABLES:
+                    raise ApiError(
+                        422,
+                        "too_many_tables",
+                        f"Este PDF tem mais de {MAX_TABLES} tabelas. "
+                        "Divida-o com a ferramenta Dividir PDF e converta cada parte.",
+                    )
                 n_cells += sum(len(r) for r in rows)
                 if n_cells > MAX_CELLS:  # memory cap
                     raise ApiError(
@@ -2215,7 +2279,6 @@ def pdf_to_xlsx(content: bytes) -> bytes:
                         "pdf_too_complex",
                         "Demasiadas células para um só ficheiro.",
                     )
-                n_tables += 1
                 ws = wb.create_sheet(title=_sheet_title(pno, ti))
                 for r_idx, row in enumerate(rows, start=1):
                     for c_idx, val in enumerate(row, start=1):
@@ -2231,10 +2294,6 @@ def pdf_to_xlsx(content: bytes) -> bytes:
                             cell.data_type = "s"
                         elif number_format:
                             cell.number_format = number_format
-                if n_tables >= MAX_TABLES:
-                    break
-            if n_tables >= MAX_TABLES:
-                break
 
         if n_tables == 0:
             # Decide scanned-vs-no-tables AFTER extraction: a sparse legit table

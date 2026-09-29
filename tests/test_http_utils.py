@@ -1,5 +1,9 @@
 """Regression coverage for response headers shared by every download route."""
 
+import pytest
+
+from app import http_utils
+from app.api_errors import ApiError
 from app.http_utils import attachment_headers, file_response
 
 
@@ -15,6 +19,18 @@ def test_attachment_header_supports_decomposed_portuguese_filename():
     # re-decomposes on save either way.
     assert "filename*=UTF-8''relat%C3%B5rio-conversa%C3%A7%C3%A3o.pdf" in disposition
     disposition.encode("ascii")
+
+
+def test_file_response_refuses_output_over_limit(monkeypatch):
+    monkeypatch.setattr(http_utils, "MAX_RESPONSE_BYTES", 4)
+
+    with pytest.raises(ApiError) as error:
+        file_response(b"12345", "application/pdf", "large.pdf", "output.pdf")
+
+    assert error.value.status_code == 422
+    assert error.value.code == "output_too_large"
+    assert "30 MB" in error.value.message
+    assert "Dividir PDF" in error.value.message
 
 
 def test_attachment_header_strips_paths_quotes_and_controls():

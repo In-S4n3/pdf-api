@@ -46,11 +46,17 @@ def test_redact_with_empty_confirmed_ids_redacts_nothing():
     assert "bob@example.org" in text
 
 
-def test_redact_with_unknown_ids_silently_skips():
-    output = redact_pdf(FIXTURE.read_bytes(), strategy="email", confirmed_ids=["deadbeef00000000"])
-    text = _extract_text(output)
-    # Unknown ID → no redactions applied
-    assert "alice@example.com" in text
+def test_redact_with_unknown_ids_refuses_stale_preview():
+    alice_id = next(m.id for m in _matches_for() if "alice" in m.full_match)
+    with pytest.raises(ApiError) as exc:
+        redact_pdf(
+            FIXTURE.read_bytes(),
+            strategy="email",
+            confirmed_ids=[alice_id, "deadbeef00000000"],
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.code == "preview_stale"
+    assert "pré-visualização" in exc.value.message.lower()
 
 
 def test_redact_encrypted_pdf_returns_400():

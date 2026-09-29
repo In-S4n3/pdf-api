@@ -18,6 +18,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api_errors import ApiError
 from app.config import get_settings
+from app.services.pdf_tools import MAX_RESPONSE_BYTES
 
 #: Long enough for any real filename. The name reaches us from a caller, not
 #: from a disk, so nothing else bounds it — and h11 caps a response's headers at
@@ -109,6 +110,14 @@ def attachment_headers(filename: str | None, default: str) -> dict[str, str]:
 
 def file_response(content: bytes, media_type: str, filename: str | None, default: str) -> Response:
     """Create a binary attachment response."""
+    if len(content) > MAX_RESPONSE_BYTES:
+        raise ApiError(
+            422,
+            "output_too_large",
+            "O resultado ultrapassa 30 MB, o máximo que conseguimos entregar. "
+            "Tente com um ficheiro mais pequeno ou, para PDFs com várias páginas, "
+            "use «Dividir PDF» e processe cada parte.",
+        )
     return Response(
         content=content,
         media_type=media_type,
