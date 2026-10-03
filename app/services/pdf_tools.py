@@ -1851,6 +1851,21 @@ def _store_redacted_jpegs_as_jpeg(page, jpeg_boxes: set[tuple[float, ...]]) -> N
         doc.xref_set_key(xref, "Filter", "/DCTDecode")
 
 
+def _without_xref_holes(doc):
+    """scrub() reads every object number and raises on one no xref section
+    defines. That is valid PDF — the object is null — and pyHanko-signed files
+    and pdf-lib saves have them: Censurar answered 500. Renumbering closes them.
+    """
+    for xref in range(1, doc.xref_length()):
+        try:
+            doc.xref_object(xref)
+        except Exception:
+            clean = pymupdf.open(stream=doc.tobytes(garbage=2), filetype="pdf")
+            doc.close()
+            return clean
+    return doc
+
+
 def redact_pdf(
     content: bytes,
     *,
@@ -1927,6 +1942,7 @@ def redact_pdf(
         # PyMuPDF 1.27 it removed nothing (it needs "3 Tr" alone on a line), and
         # where it did work it would strip a scan's whole OCR layer; the matched
         # invisible characters are removed by apply_redactions like any other.
+        doc = _without_xref_holes(doc)
         doc.scrub(
             attached_files=True,
             embedded_files=True,
@@ -1946,6 +1962,11 @@ def redact_pdf(
         # 1.27 docs). Clear the TOC explicitly so bookmark titles cannot leak
         # — this is the exact EU AstraZeneca 2021 failure mode.
         doc.set_toc([])
+        # A certification signature (/Perms) and validation data (/DSS) keep the
+        # signer's certificate and contact details, which a redacted email can
+        # be. Every signature is invalid after the rewrite anyway.
+        for key in ("Perms", "DSS"):
+            doc.xref_set_key(doc.pdf_catalog(), key, "null")
 
         output = doc.tobytes(garbage=4, deflate=True, clean=True)
         if len(output) > MAX_RESPONSE_BYTES:
