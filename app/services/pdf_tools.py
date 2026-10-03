@@ -11,11 +11,13 @@ import math
 import os
 import re as _re
 import signal
+import string
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
@@ -161,6 +163,11 @@ CONFORMANCE_MAP = {
 }
 
 REGEX_TIMEOUT_SECONDS = 0.5
+_REGEX_TOO_SLOW_MESSAGE = "O padrão regex é demasiado complexo (possível ReDoS). Simplifique-o."
+_REDACT_AS_IMAGES = (
+    "Converta-o em imagens com PDF para Imagem, junte-as num PDF com Converter para "
+    "PDF, passe-o pelo OCR PDF e censure o resultado."
+)
 
 # \w, not [a-zA-Z]: "joão@exemplo.pt" is an address too, and with an ASCII
 # class the \b before it could never fire after the «ã».
@@ -315,6 +322,7 @@ def _iter_matches(
     no_view = pymupdf.PDF_ANNOT_IS_NO_VIEW
     pymupdf.TOOLS.set_small_glyph_heights(True)
     try:
+        marked = []
         for page in doc:
             for annot in [a for a in page.annots() if a.flags & no_view]:
                 page.delete_annot(annot)
@@ -327,54 +335,367 @@ def _iter_matches(
                 _check_image_budget(doc, pages=[page.number])
                 for mark in marks:
                     _prepare_pending_mark(page, mark)
-                jpeg_boxes = _jpeg_image_boxes(page)
-                page.apply_redactions(
-                    images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
-                    graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
-                )
-                _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
+                marked.append(page.number)
+        page = marks = mark = None  # reload_page refuses a page something else holds
+        _apply_redactions(doc, marked, deadline, marks=True)
     finally:
         pymupdf.TOOLS.set_small_glyph_heights(False)
     doc.bake(annots=True, widgets=True)
 
-    seen_ids: set[str] = set()
-    for page_idx, page in enumerate(doc):
-        _check_deadline(deadline, _SCAN_TIMEOUT_MESSAGE)
-        text = page.get_text("text")
-        # First spelling of each match, in reading order. Case variants collapse
-        # (search_for is case-insensitive and would box the same place twice),
-        # and whitespace collapses to one space: search_for spans line breaks
-        # and non-breaking spaces, a literal "\n" or "\xa0" in the needle not.
-        needles: dict[str, str] = {}
-        try:
-            for regex_match in compiled_pattern.finditer(text, timeout=REGEX_TIMEOUT_SECONDS):
-                needle = " ".join(regex_match.group().split())
-                if needle:
-                    needles.setdefault(needle.casefold(), needle)
-        except regex.error as exc:
-            raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
-        except TimeoutError as exc:
-            raise ApiError(
-                400, "regex_too_slow",
-                "O padrão regex é demasiado complexo (possível ReDoS). Simplifique-o.",
-            ) from exc
-
-        for needle in needles.values():
+    search_doc = _with_every_layer_on(doc)
+    try:
+        _check_text_in_fill_patterns(search_doc, compiled_pattern, deadline)
+        form_pages: Counter | None = None
+        pages_per_image: Counter | None = None
+        seen_ids: set[str] = set()
+        for page_idx, page in enumerate(search_doc):
             _check_deadline(deadline, _SCAN_TIMEOUT_MESSAGE)
-            for rect in page.search_for(needle):
-                # Decompose the match rect into per-word bboxes for clean preview highlights.
-                words = page.get_text("words", clip=rect)
-                boxes = (
-                    [(w[0], w[1], w[2], w[3], w[4]) for w in words]
-                    if words
-                    else [(rect.x0, rect.y0, rect.x1, rect.y1, needle)]
+            # What a reader extracts (MuPDF puts /ActualText in place of the
+            # glyphs), then what the page draws: «ana at example dot com» as
+            # replacement text hid the drawn ana@example.com from the matcher.
+            text = page.get_text("text", flags=pymupdf.TEXTFLAGS_TEXT)
+            views = [(0, text)]
+            held = page.get_text("text", flags=_HELD, clip=pymupdf.INFINITE_RECT())
+            if held != text:
+                drawn = page.get_text("text", flags=pymupdf.TEXTFLAGS_TEXT | _DRAWN)
+                if drawn != text:
+                    views.append((_DRAWN, drawn))
+                _check_text_outside_the_page(doc, page, compiled_pattern, drawn, held)
+
+            trace = page.get_texttrace()
+            if _unextracted_matches(page, trace, compiled_pattern):
+                raise ApiError(
+                    422,
+                    "text_of_no_size",
+                    "Este PDF tem texto escondido, desenhado sem tamanho, que não "
+                    "conseguimos censurar com segurança. " + _REDACT_AS_IMAGES,
                 )
-                for x0, y0, x1, y1, word_text in boxes:
-                    match = _make_match(strategy, page_idx, (x0, y0, x1, y1), word_text, needle)
-                    if match.id in seen_ids:
+
+            searches = [(view, n) for view, text in views for n in _needles(compiled_pattern, text)]
+            if searches and form_pages is None:
+                form_pages = Counter(x for p in doc for x in {f[0] for f in p.get_xobjects()})
+                pages_per_image = Counter(
+                    x for p in doc for x in {i[0] for i in p.get_images(full=True)})
+            if searches:  # the apply refuses it on this page, after payment
+                _check_image_budget(doc, pages=[page_idx])
+            inline = _inline_images_in_shared_forms(doc, page_idx, form_pages) if searches else []
+            in_pixels = _in_pixels(trace)
+            covered = []  # boxes that may cover the match in an image's pixels too
+            matched: dict = {}  # per view, read once the page has a hit
+            for view, needle in searches:
+                _check_deadline(deadline, _SCAN_TIMEOUT_MESSAGE)
+                for rect in page.search_for(needle, flags=_SEARCH_FLAGS | view):
+                    if view not in matched:
+                        matched[view] = _where_it_matches(page, compiled_pattern, view)
+                    if not matched[view](rect, needle):
                         continue
-                    seen_ids.add(match.id)
-                    yield match
+                    if in_pixels(rect):
+                        if any(rect.intersects(image) for image in inline):
+                            raise ApiError(
+                                422,
+                                "image_in_shared_form",
+                                "Este PDF repete a mesma imagem em várias páginas através de um "
+                                "modelo, e não a conseguimos censurar em todas. "
+                                + _REDACT_AS_IMAGES,
+                            )
+                        covered.append(rect)
+                    # Decompose the match rect into per-word bboxes for clean preview highlights.
+                    words = page.get_text("words", clip=rect, flags=pymupdf.TEXTFLAGS_WORDS | view)
+                    boxes = (
+                        [(w[0], w[1], w[2], w[3], w[4]) for w in words]
+                        if words
+                        else [(rect.x0, rect.y0, rect.x1, rect.y1, needle)]
+                    )
+                    for x0, y0, x1, y1, word_text in boxes:
+                        bbox = (x0, y0, x1, y1)
+                        match = _make_match(strategy, page_idx, bbox, word_text, needle)
+                        if match.id in seen_ids:
+                            continue
+                        seen_ids.add(match.id)
+                        yield match
+            if covered:
+                _check_image_copies(doc[page_idx], covered, pages_per_image)
+    finally:
+        if search_doc is not doc:
+            search_doc.close()
+
+
+def _where_it_matches(page, compiled_pattern, view: int):
+    """Whether a search_for hit is where the pattern matches the page text.
+
+    search_for finds the needle inside more text too: the phone 912345678 cost
+    the account 19123456780 its digits. The page is read glyph by glyph, the
+    pattern run over all of it — a lookbehind may look at the line above — and
+    a hit stands if a glyph under it lies in a match that holds the needle.
+    By position: the phone drawn twice made two hits for two matches, one in
+    the account; and an OCR'd page draws hidden text over its own, two copies
+    under one hit. A match that holds the needle: «Ana Silva» found inside
+    «Ana Silvano» stood on the match «Silvano». Not every glyph: a font kerns
+    «V.», and the full stop's centre fell inside «ana@example.TV».
+    """
+    lines, text = [], []
+    for block in page.get_text("rawdict", flags=_SEARCH_FLAGS | view)["blocks"]:
+        for line in block.get("lines", ()):
+            chars = [c for span in line["spans"] for c in span["chars"]]
+            centres = [pymupdf.Point((x0 + x1) / 2, (y0 + y1) / 2)
+                       for x0, y0, x1, y1 in (c["bbox"] for c in chars)]
+            lines.append((pymupdf.Rect(line["bbox"]), len(text), centres))
+            text += [c["c"] for c in chars] + ["\n"]
+    text = "".join(text)
+    found, in_match = [], [None] * len(text)
+    for m in _finditer(compiled_pattern, text):
+        found.append(" ".join(m.group().split()).translate(_ASCII_LOWER))
+        in_match[m.start():m.end()] = [len(found) - 1] * (m.end() - m.start())
+
+    def stands(rect, needle: str) -> bool:
+        hit = [start + i for box, start, centres in lines if box.intersects(rect)
+               for i, centre in enumerate(centres) if centre in rect]
+        needle = " ".join(needle.split()).translate(_ASCII_LOWER)
+        return not hit or any(
+            in_match[i] is not None and needle in found[in_match[i]] for i in hit)
+
+    return stands
+
+
+# The text a page draws, without /ActualText in place of its glyphs.
+_DRAWN = pymupdf.TEXT_IGNORE_ACTUALTEXT
+# All of it, also where no viewer shows it (off the page, outside the CropBox).
+_HELD = (pymupdf.TEXTFLAGS_TEXT & ~pymupdf.TEXT_MEDIABOX_CLIP) | _DRAWN
+# search_for's own default flags, spelled out so a view can add _DRAWN.
+_SEARCH_FLAGS = (
+    pymupdf.TEXT_DEHYPHENATE
+    | pymupdf.TEXT_PRESERVE_WHITESPACE
+    | pymupdf.TEXT_PRESERVE_LIGATURES
+    | pymupdf.TEXT_MEDIABOX_CLIP
+)
+
+
+def _occurrences(compiled_pattern, text: str) -> list[str]:
+    """Every match in text, its whitespace collapsed to one space: search_for
+    spans line breaks and non-breaking spaces, a literal "\\n" or "\\xa0" in
+    the needle not."""
+    found = (" ".join(match.group().split()) for match in _finditer(compiled_pattern, text))
+    return [needle for needle in found if needle]
+
+
+def _finditer(compiled_pattern, text: str) -> list:
+    try:
+        return list(compiled_pattern.finditer(text, timeout=REGEX_TIMEOUT_SECONDS))
+    except regex.error as exc:
+        raise ApiError(400, "invalid_regex_pattern", "Padrão regex inválido.") from exc
+    except TimeoutError as exc:
+        raise ApiError(400, "regex_too_slow", _REGEX_TOO_SLOW_MESSAGE) from exc
+
+
+def _needles(compiled_pattern, text: str) -> list[str]:
+    """First spelling of each match, in reading order. Variants in ASCII case
+    collapse: search_for ignores it and would box the same place twice. It
+    does not ignore «Ã»: collapsed into «João», «JOÃO» was never searched."""
+    needles: dict[str, str] = {}
+    for needle in _occurrences(compiled_pattern, text):
+        needles.setdefault(needle.translate(_ASCII_LOWER), needle)
+    return list(needles.values())
+
+
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _with_every_layer_on(doc):
+    """doc, or a copy of it that draws every optional-content layer.
+
+    MuPDF extracts only what is drawn, and a layer that is off draws nothing —
+    yet any reader can switch it on, and its text was never redacted. Matching
+    runs on the copy; the boxes apply to doc, where apply_redactions removes
+    the hidden glyphs as well and the layer stays off.
+
+    The copy has no /OCProperties at all, so MuPDF treats nothing as optional.
+    Every layer on was not enough: a layer's own /Usage /ViewState /OFF still
+    hid it, and content shown only while a layer is off (/P /AllOff) vanished
+    from the copy — a visible email went unredacted.
+    """
+    if doc.xref_get_key(doc.pdf_catalog(), "OCProperties")[0] == "null":
+        return doc
+    with pymupdf.open(stream=doc.tobytes(), filetype="pdf") as copy:
+        copy.xref_set_key(copy.pdf_catalog(), "OCProperties", "null")
+        return pymupdf.open(stream=copy.tobytes(), filetype="pdf")  # MuPDF reads layers on open
+
+
+def _clip_to_the_page(page) -> None:
+    """Remove what is drawn wholly outside the CropBox; a glyph across the edge stays.
+
+    MuPDF clips in PDF coordinates, unrotated. Page.clip_to_rect maps the rect
+    the wrong way (page to PDF with the PDF-to-page matrix): on a CropBox that
+    does not start at 0 0 it cut every visible glyph, and a turned page.rect
+    cut visible text too.
+    """
+    rotation = page.rotation
+    page.set_rotation(0)
+    box = page.rect * ~page.transformation_matrix  # the CropBox, in PDF coordinates
+    pymupdf.mupdf.pdf_clip_page(
+        pymupdf.mupdf.pdf_page_from_fz_page(page.this), pymupdf.mupdf.FzRect(*box))
+    page.set_rotation(rotation)
+
+
+def _text_in_fill_pattern() -> ApiError:
+    return ApiError(
+        422,
+        "text_in_fill_pattern",
+        "Este PDF tem texto dentro de um padrão de preenchimento, onde não o "
+        "conseguimos censurar com segurança. " + _REDACT_AS_IMAGES,
+    )
+
+
+def _check_text_in_fill_patterns(doc, compiled_pattern, deadline: float) -> None:
+    """Refuse a match inside a tiling pattern's cell.
+
+    MuPDF reports a cell's text but can neither place nor remove it: the box
+    went somewhere else and the email stayed in the pattern. Each cell is read
+    on its own, drawn as a form on a scratch page: a fill of no area painted
+    nothing on the page, and its cell still held the email.
+    """
+    if not _tiling_cells(doc):
+        return
+    with pymupdf.open(stream=doc.tobytes(), filetype="pdf") as scratch:
+        for xref in _tiling_cells(scratch):  # its own numbers, whatever the save did
+            _check_deadline(deadline, _SCAN_TIMEOUT_MESSAGE)
+            scratch.xref_set_key(xref, "Type", "/XObject")
+            scratch.xref_set_key(xref, "Subtype", "/Form")
+            page = scratch.new_page()
+            contents = scratch.get_new_xref()
+            scratch.update_object(contents, "<<>>")
+            scratch.update_stream(contents, b"/Cell Do")
+            scratch.xref_set_key(page.xref, "Resources", f"<</XObject<</Cell {xref} 0 R>>>>")
+            scratch.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+            if _held_matches(scratch.reload_page(page), compiled_pattern):
+                raise _text_in_fill_pattern()
+
+
+def _inline_images_in_shared_forms(doc, page_number: int, form_pages: Counter) -> list:
+    """Where the page draws an inline image, if it draws a form XObject that
+    other pages draw too and that holds one. MuPDF blanks the pixels under a
+    box in a copy of the form for this page; the other pages kept the original,
+    and nothing pairs a form with its copy (Fx became Fm1)."""
+    page = doc[page_number]
+    if not any(form_pages[x] > 1 and _holds_inline_image(doc, x) for x, *_ in page.get_xobjects()):
+        return []
+    return [pymupdf.Rect(i["bbox"]) for i in page.get_image_info(xrefs=True) if i["xref"] == 0]
+
+
+def _holds_inline_image(doc, xref: int) -> bool:
+    """Whether a form's content draws an inline image. Its operators, parsed:
+    «(Monthly BI Report)» holds the bytes BI too. Sized in pieces first; too
+    heavy to parse, or unparseable, counts as yes."""
+    import pikepdf
+
+    if doc.xref_get_key(xref, "Filter")[1] == "null":
+        pieces = [doc.xref_stream_raw(xref)]
+    elif (doc.xref_get_key(xref, "Filter")[1], doc.xref_get_key(xref, "DecodeParms")[0]) == (
+        "/FlateDecode", "null"
+    ):
+        pieces = _inflate(doc.xref_stream_raw(xref))
+    else:  # ponytail: other filters decode whole; rare in content streams
+        pieces = [doc.xref_stream(xref)]
+    if sum(len(piece) for piece in pieces) > _MAX_PARSED_CONTENT_BYTES:
+        return True
+    with pikepdf.new() as pdf:
+        try:
+            instructions = pikepdf.parse_content_stream(pdf.make_stream(doc.xref_stream(xref)))
+        except Exception:
+            return True
+        return any(isinstance(i, pikepdf.ContentStreamInlineImage) for i in instructions)
+
+
+def _tiling_cells(doc) -> list[int]:
+    cells = []
+    for xref in range(1, doc.xref_length()):
+        with suppress(Exception):  # a number no xref section defines raises; it is null
+            if doc.xref_get_key(xref, "PatternType")[1] == "1" and doc.xref_is_stream(xref):
+                cells.append(xref)
+    return cells
+
+
+def _unextracted_matches(page, spans, compiled_pattern) -> list[str]:
+    """Matches in what get_texttrace spans draw and get_text does not return:
+    text at no size or flat on one axis (a zero font size, a flat matrix). No
+    viewer shows it and the matcher never saw it, yet the file holds it.
+    get_text("text") even split a flat email one character per line.
+
+    Compared glyph by glyph wherever the spans hold a match. Counting matches
+    was cheaper, but an email split across two fonts is two spans, and a copy
+    at no size took its place in the count."""
+
+    def text(chars) -> str:
+        return "".join(chr(c[0]) if 0 < c[0] < 0x110000 else "\ufffd" for c in chars)
+
+    if not _occurrences(compiled_pattern, "\n".join(text(s["chars"]) for s in spans)):
+        return []
+    raw = page.get_text("rawdict", flags=_HELD, clip=pymupdf.INFINITE_RECT())
+    extracted = {
+        (round(c["origin"][0], 1), round(c["origin"][1], 1))
+        for block in raw["blocks"] for line in block.get("lines", ())
+        for span in line["spans"] for c in span["chars"]
+    }
+    left = "\n".join(
+        text(c for c in s["chars"]
+             if not s["size"] or (round(c[2][0], 1), round(c[2][1], 1)) not in extracted)
+        for s in spans
+    )
+    return _occurrences(compiled_pattern, left)
+
+
+def _in_pixels(spans, *, marks: bool = False):
+    """Whether a box may hold its match in an image's pixels too: it centres
+    glyphs get_texttrace spans draw for nobody — invisible (3 Tr) or
+    transparent, an OCR layer over a scan — and no visible glyph. A digital
+    page run through OCR keeps a visible twin of each word, over a background.
+    Another editor's mark needs no hidden glyph: a scan may have no OCR layer.
+
+    Glyphs, not spans: labels in columns are one span with spaces between
+    them, and its box took the OCR'd email between them for visible text.
+    """
+
+    def centres(kind) -> list:
+        return [
+            pymupdf.Point((c[3][0] + c[3][2]) / 2, (c[3][1] + c[3][3]) / 2)
+            for s in spans if kind(s) for c in s["chars"]
+            if not (0 < c[0] < 0x110000 and chr(c[0]).isspace())
+        ]
+
+    hidden = centres(lambda s: s["type"] == 3 or not s["opacity"])
+    shown = centres(lambda s: s["type"] in (0, 1) and s["opacity"])
+    return lambda box: (
+        (marks or any(glyph in box for glyph in hidden))
+        and not any(glyph in box for glyph in shown)
+    )
+
+
+def _held_matches(page, compiled_pattern) -> Counter:
+    text = page.get_text("text", flags=_HELD, clip=pymupdf.INFINITE_RECT())
+    found = _occurrences(compiled_pattern, text)
+    found += _unextracted_matches(page, page.get_texttrace(), compiled_pattern)
+    return Counter(n.casefold() for n in found)
+
+
+def _check_text_outside_the_page(doc, page, compiled_pattern, drawn: str, held: str) -> None:
+    """Remove matches no viewer shows, or refuse the file.
+
+    Text off the page or below the CropBox is shown by no viewer, so nobody
+    redacts it, yet every extractor returns it. MuPDF also reports the text of
+    a tiling pattern's cell, where it cannot place or remove it: a box at the
+    coordinates it gives blacked out unrelated text and left the email.
+    """
+    shown = Counter(n.casefold() for n in _occurrences(compiled_pattern, drawn))
+
+    def outside(held: str) -> Counter:
+        return Counter(n.casefold() for n in _occurrences(compiled_pattern, held)) - shown
+
+    if not outside(held):
+        return
+    _clip_to_the_page(doc[page.number])
+    if page.parent is not doc:
+        _clip_to_the_page(page)
+    if outside(page.get_text("text", flags=_HELD, clip=pymupdf.INFINITE_RECT())):
+        raise _text_in_fill_pattern()
 
 
 def _prepare_pending_mark(page, mark) -> None:
@@ -396,15 +717,25 @@ def _prepare_pending_mark(page, mark) -> None:
     points = mark.vertices or []
     if len(points) < 4:  # no whole quad: MuPDF removes under the /Rect it fills
         return
+    keys = _redact_keys(mark)
     for i in range(0, len(points) - 3, 4):
-        piece = page.add_redact_annot(pymupdf.Quad(points[i : i + 4]).rect, cross_out=False)
-        for key in ("IC", "DA", "OverlayText", "Q"):
-            kind, value = doc.xref_get_key(mark.xref, key)
-            if kind != "null":
-                doc.xref_set_key(
-                    piece.xref, key, pymupdf.get_pdf_str(value) if kind == "string" else value
-                )
+        _add_redaction(page, pymupdf.Quad(points[i : i + 4]).rect, keys)
     page.delete_annot(mark)
+
+
+def _redact_keys(mark) -> dict:
+    """What a /Redact mark paints in place of what it removes."""
+    return {key: mark.parent.parent.xref_get_key(mark.xref, key)
+            for key in ("IC", "DA", "OverlayText", "Q")}
+
+
+def _add_redaction(page, rect, keys: dict) -> None:
+    piece = page.add_redact_annot(rect, cross_out=False)
+    for key, (kind, value) in keys.items():
+        if kind != "null":
+            page.parent.xref_set_key(
+                piece.xref, key, pymupdf.get_pdf_str(value) if kind == "string" else value
+            )
 
 
 def _extract_matches(
@@ -1851,6 +2182,547 @@ def _store_redacted_jpegs_as_jpeg(page, jpeg_boxes: set[tuple[float, ...]]) -> N
         doc.xref_set_key(xref, "Filter", "/DCTDecode")
 
 
+def _image_placements(page, among: set[int]) -> dict[int, tuple]:
+    """Every box where the page draws each of these image objects, and its size.
+    get_images lists an image once per resource name, and one name can be drawn
+    twice. No box: listed, never drawn — pages sharing one resource dictionary
+    each list every page's images."""
+    placements: dict[int, tuple] = {}
+    for item in page.get_images(full=True):
+        if item[0] in among:
+            boxes = placements.setdefault(item[0], (set(), item[2], item[3]))[0]
+            with suppress(Exception):  # drawn through a form XObject
+                for rect in page.get_image_rects(item):
+                    if rect.x0 < rect.x1 and rect.y0 < rect.y1:  # not (1, 1, -1, -1)
+                        boxes.add(tuple(round(v, 1) for v in rect))
+    return placements
+
+
+def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False) -> None:
+    """apply_redactions on these pages, and what it blanks in a scan blanked
+    wherever the scan is drawn.
+
+    MuPDF blanks a copy of an image for the place it redacts; any other place
+    drawing the same image — another page, or this one again — kept the
+    original: the email intact under a crop or a white box. Each redaction is
+    copied back over the original, so the next page redacts from there, and in
+    the end every copy holds every blanked box.
+
+    Only under a box _in_pixels allows — an OCR layer over a scan, or another
+    editor's mark over no visible text. The page's other boxes wait until every
+    scan is blanked everywhere, then blank this page's copy alone: visible text
+    over a shared scan or background is not in its pixels, and blanked
+    everywhere, every other page got a hole where the email was. A mark over
+    visible text and a shared image is refused: the image may hold what it
+    marks, or be a background.
+
+    ponytail: every shared image under an OCR box is blanked everywhere, a
+    background under a pasted OCR'd scan too (a hole on other pages). Which
+    image shows there takes a render to tell: a clip let a scan show through an
+    opaque photo whose box covered the email.
+    """
+    blanked: dict[int, list[int]] = {}
+    held_back: list[tuple[int, list]] = []
+    pages_per_image = Counter(
+        xref for page in doc for xref in {i[0] for i in page.get_images(full=True)}
+    )
+    pages_per_image.update(_drawn_in_a_layer_off(doc, page_numbers))
+    for page_idx in page_numbers:
+        _check_deadline(deadline)
+        page = doc[page_idx]
+        drawn = {item[0] for item in page.get_images(full=True)}
+        marked = list(page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)))
+        in_pixels = _in_pixels(page.get_texttrace(), marks=marks)
+        before = _image_placements(page, drawn) if marked and drawn else {}
+        local = [annot for annot in marked if not in_pixels(annot.rect)]
+        if marks and local and drawn and _mark_over_shared_image(
+            doc, page_idx, [annot.rect for annot in local], pages_per_image
+        ):
+            raise ApiError(
+                422,
+                "mark_over_shared_image",
+                "Este PDF tem uma marca de censura por aplicar sobre uma imagem que se repete "
+                "noutras páginas, e não a conseguimos censurar em todas com segurança. "
+                + _REDACT_AS_IMAGES,
+            )
+        boxes = [annot.rect for annot in marked if in_pixels(annot.rect)]
+        shared = _shared_under(before, boxes, pages_per_image)
+        later = local if shared else []
+        if later:
+            held_back.append((page_idx, [(annot.rect, _redact_keys(annot)) for annot in later]))
+            for annot in later:
+                page.delete_annot(annot)
+        _redact_page(page)
+        if not shared:
+            continue
+        page = doc.reload_page(page)  # get_image_rects caches where images were
+        now = {item[0] for item in page.get_images(full=True)}
+        after = _image_placements(page, now - drawn)
+        # Only what the page drew: the cleanup after a redaction also drops
+        # images it merely listed, drawn elsewhere.
+        gone = {x for x, place in before.items() if place[0]} - now
+        pairs = _redacted_copies(before, after, gone)
+        # Drawn twice, redacted twice: two copies, each blank only in its own
+        # box; one over the image undid the other. The preview refuses it
+        # where the image shows anywhere else; under a mark, it goes.
+        once = {x for x, n in Counter(x for x, _ in pairs).items() if n == 1}
+        for original, copy in pairs:
+            if original in shared & once:
+                _copy_object(doc, copy, original)
+                blanked.setdefault(original, []).append(copy)
+        for original in shared & (gone | {x for x, _ in pairs}) - once:
+            page.replace_image(original, pixmap=_NO_IMAGE)
+    for original, copies in blanked.items():
+        for copy in copies:
+            _copy_object(doc, original, copy)
+    page = marked = later = None  # reload_page refuses a page something else holds
+    for page_idx, kept in held_back:
+        _check_deadline(deadline)
+        page = doc.reload_page(doc[page_idx])  # get_image_info caches where images were
+        for rect, keys in kept:
+            _add_redaction(page, rect, keys)
+        _redact_page(page)
+
+
+def _redact_page(page) -> None:
+    jpeg_boxes = _jpeg_image_boxes(page)
+    page.apply_redactions(
+        images=pymupdf.PDF_REDACT_IMAGE_PIXELS,  # blank what the box covers
+        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+        text=pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
+    )
+    _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
+
+
+def _drawn_in_a_layer_off(doc, page_numbers) -> set[int]:
+    """Images these pages draw again in a layer that is off. The page's own
+    placements miss them, so the image was not taken for drawn twice, and that
+    placement, off the box, kept the scan as it was: switched on, it showed the
+    email. Counted as shared, the image is blanked everywhere."""
+    seen = _with_every_layer_on(doc)
+    if seen is doc:
+        return set()
+    try:
+        again = set()
+        for number in page_numbers:
+            listed = {item[0] for item in doc[number].get_images(full=True)}
+            if listed:
+                shown = _image_placements(doc[number], listed)
+                every = _image_placements(seen[number], listed)
+                again |= {x for x in listed if len(every[x][0]) > len(shown[x][0])}
+        return again
+    finally:
+        seen.close()
+
+
+def _mark_over_shared_image(doc, page_number: int, boxes: list, pages_per_image) -> bool:
+    """Whether these boxes cover an image the page draws twice, or another page
+    draws too. Looked at with every layer on: a layer that is off draws
+    nothing, yet any reader switches it on — and there the scan kept what the
+    mark covered."""
+    seen = _with_every_layer_on(doc)
+    try:
+        page = seen[page_number]
+        placements = _image_placements(page, {i[0] for i in page.get_images(full=True)})
+        return any(
+            len(placements[x][0]) > 1 or _drawn_elsewhere(seen, x, page_number)
+            for x in _shared_under(placements, boxes, pages_per_image)
+        )
+    finally:
+        if seen is not doc:
+            seen.close()
+
+
+def _drawn_elsewhere(doc, xref: int, page_number: int) -> bool:
+    """Whether another page draws the image, not merely lists it: pages sharing
+    one resource dictionary each list every page's images."""
+    return any(
+        _image_placements(page, {xref}).get(xref, (set(),))[0]
+        for page in doc
+        if page.number != page_number and xref in {i[0] for i in page.get_images(full=True)}
+    )
+
+
+def _shared_under(placements: dict, boxes: list, pages_per_image: Counter) -> set[int]:
+    """The images under these boxes that another page or place draws too."""
+    return {
+        x for x, (places, *_) in placements.items()
+        if (pages_per_image[x] > 1 or len(places) > 1)
+        and any(pymupdf.Rect(place).intersects(box) for place in places for box in boxes)
+    }
+
+
+def _check_image_copies(page, boxes: list, pages_per_image: Counter) -> None:
+    """Refuse what _apply_redactions cannot put back without hiding more: an
+    image these boxes cover in two places that shows anywhere else, or two
+    images they cover alike in place and size, one of them shown elsewhere.
+    Nothing tells those blanked copies apart, and the image went from every
+    page — a logo the email was never in vanished from the next one.
+
+    get_image_rects finds an image by its pixels, so two objects with the same
+    pixels share their places; alike, they are not told apart, nor need to be.
+    """
+    sizes = {item[0]: item[2:4] for item in page.get_images(full=True)}
+    placements = _image_placements(page, set(sizes)) if sizes else {}
+    alike: dict[tuple, set[int]] = {}
+    for xref, (places, *size) in placements.items():
+        hit = {place for place in places if any(pymupdf.Rect(place).intersects(b) for b in boxes)}
+        if len(hit) > 1 and (pages_per_image[xref] > 1 or len(places) > len(hit)):
+            raise ApiError(
+                422,
+                "image_redacted_twice",
+                "Este PDF desenha a mesma imagem em vários sítios, e não a conseguimos "
+                "censurar em todos sem a apagar noutras páginas. " + _REDACT_AS_IMAGES,
+            )
+        for place in hit:
+            alike.setdefault((place, *size), set()).add(xref)
+    for xrefs in alike.values():
+        if (
+            len(xrefs) > 1
+            and any(pages_per_image[x] > 1 or len(placements[x][0]) > 1 for x in xrefs)
+            and len({pymupdf.Pixmap(page.parent, x).digest for x in xrefs}) > 1
+        ):
+            raise ApiError(
+                422,
+                "images_alike",
+                "Este PDF tem imagens sobrepostas, do mesmo tamanho, que se repetem noutras "
+                "páginas, e não conseguimos censurar só a certa. " + _REDACT_AS_IMAGES,
+            )
+
+
+def _redacted_copies(before: dict, after: dict, gone: set[int]) -> list[tuple[int, int]]:
+    """Pair each image a redaction put on the page with the one it replaced.
+
+    By a box it is drawn in and its size — the redaction renames the resource
+    (fzImg0 became Im1), and an image drawn twice keeps its other place — or,
+    where boxes are alike (a photo under a full-page overlay of its size) or
+    the copy's cannot be read, by size when one image of it left the page and
+    one copy of it came: a logo still on the page is never a candidate.
+    Pixels cannot decide: a blanked copy looked more like the logo than its
+    own photo. A wrong pair put one image over another.
+    """
+    def keys(place) -> set:
+        boxes, *size = place
+        return {(box, *size) for box in boxes}
+
+    alike = Counter(key for place in before.values() for key in keys(place))
+    at = {key: x for x, place in before.items() for key in keys(place) if alike[key] == 1}
+    pairs = []
+    for copy, place in after.items():
+        if len(found := {at[key] for key in keys(place) if key in at}) == 1:
+            pairs.append((found.pop(), copy))
+    paired = {original for original, _ in pairs} | {copy for _, copy in pairs}
+    left = Counter(before[x][1:] for x in gone - paired)
+    came = Counter(place[1:] for copy, place in after.items() if copy not in paired)
+    for copy, place in after.items():
+        if copy not in paired and left[place[1:]] == came[place[1:]] == 1:
+            pairs += [(x, copy) for x in gone - paired if before[x][1:] == place[1:]]
+    return pairs
+
+
+# What MuPDF leaves of an image wholly inside a redaction box: nothing, and every
+# other page drawing it showed the whole image. A shared image that left the page
+# with no copy to pair — removed, or alike another — is drawn by no page: more
+# than was asked, never less.
+_NO_IMAGE = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 1, 1), True)
+_NO_IMAGE.clear_with()  # transparent: with a value, alpha stays opaque
+
+
+def _copy_object(doc, source: int, target: int) -> None:
+    doc.update_stream(target, doc.xref_stream_raw(source), compress=False)
+    doc.update_object(target, doc.xref_object(source, compressed=True))
+
+
+# Replacement text: what a reader copies or reads aloud instead of the glyphs, so
+# a copy of the page text. MuPDF edits /Alt glyph by glyph as it redacts, but an
+# edited /ActualText it writes into /Alt and leaves the original (1.27
+# pdf-op-filter.c, update_mcid): the email came back in text extraction.
+# Without it, a screen reader reads the drawn glyphs — the redacted text.
+_REPLACEMENT_TEXT = ("/ActualText", "/E")
+
+
+def _content_unreadable() -> ApiError:
+    return ApiError(
+        422,
+        "content_unreadable",
+        "Este PDF tem conteúdo danificado, onde não conseguimos garantir que "
+        "o texto censurado sai de todas as cópias. " + _REDACT_AS_IMAGES,
+    )
+
+
+# pikepdf holds ~55 bytes per byte of marked content it parses: 8 MiB cost 441 MiB.
+_MAX_PARSED_CONTENT_BYTES = 8 * 1024 * 1024
+
+
+def _inflate(raw: bytes) -> Iterator[bytes]:
+    """A Flate stream in 1 MiB pieces; a cut one ends where it stops, a broken
+    one is refused. Its checksum is not read, as MuPDF and qpdf do not: a wrong
+    one ended the scan, and the stream's /ActualText kept the email."""
+    inflate = zlib.decompressobj(-zlib.MAX_WBITS)  # raw deflate: no checksum
+    raw = raw[2:]  # the zlib header
+    try:
+        while raw and not inflate.eof:
+            piece = inflate.decompress(raw, 1 << 20)
+            if not piece and inflate.unconsumed_tail == raw:
+                break  # no progress
+            raw = inflate.unconsumed_tail
+            yield piece
+        yield inflate.flush()
+    except zlib.error as exc:
+        raise _content_unreadable() from exc
+
+
+def _scan_content(parts, deadline: float) -> tuple[int, bool]:
+    """A content stream's decoded size, and whether a BDC or DP in it may carry
+    an inline dictionary. Read in pieces, never whole: a 260 KB file held an
+    unused 256 MiB form, and reading it at once cost 386 MiB."""
+    import pikepdf
+
+    size, seen, tail = 0, set(), b""
+    for part in parts:
+        if not isinstance(part, pikepdf.Stream):
+            continue
+        filters = part.get("/Filter")
+        filters = list(filters) if isinstance(filters, pikepdf.Array) else [filters]
+        try:
+            if filters == [None]:
+                pieces = [part.read_raw_bytes()]
+            elif filters == [pikepdf.Name.FlateDecode] and "/DecodeParms" not in part:
+                pieces = _inflate(part.read_raw_bytes())
+            else:  # ponytail: other filters decode whole; rare in content streams
+                pieces = [part.read_bytes()]
+        except pikepdf.PdfError as exc:
+            raise _content_unreadable() from exc
+        for piece in pieces:
+            _check_deadline(deadline)
+            size += len(piece)
+            window = tail + piece
+            seen.update(token for token in (b"<<", b"BDC", b"DP") if token in window)
+            tail = piece[-2:]
+    return size, b"<<" in seen and (b"BDC" in seen or b"DP" in seen)
+
+
+def _without_hidden_copies(doc, compiled_pattern, deadline: float):
+    """Drop the copies of the text that no page draws; return the reopened doc.
+
+    Owner's call (2026-10-03, after Codex and Muse disagreed): replacement text
+    goes everywhere; a description (/Alt), a title, an id, a layer name and a
+    page label lose only what the pattern matches, so a figure keeps its
+    description for blind readers. Associated files (a Factur-X invoice),
+    application data (Illustrator keeps the whole source file), actions and
+    named destinations go whole, like the attachments, scripts and links
+    scrub() removes. A key is judged by the object holding it, never by its
+    name alone: a resource can be called /E or /AF.
+    """
+    import pikepdf
+
+    # The preview ran the pattern on the page text only. A string here that it
+    # cannot finish in time is emptied, not refused after payment; after the
+    # first one every string is, or each would cost the timeout again.
+    too_slow = False
+
+    def sweep(holder, key) -> None:
+        nonlocal too_slow
+        value = holder[key] if isinstance(holder, pikepdf.Array) else holder.get(key)
+        if not isinstance(value, pikepdf.String):
+            return
+        text = str(value)
+        try:
+            if too_slow:
+                raise TimeoutError
+            kept = compiled_pattern.sub("", text, timeout=REGEX_TIMEOUT_SECONDS)
+        except TimeoutError:
+            too_slow, kept = True, ""
+        if kept != text:
+            holder[key] = pikepdf.String(kept)
+
+    swept: set[tuple[int, int]] = set()  # indirect containers, across every call
+
+    def sweep_all(container) -> None:
+        """Every string in a dictionary or array and in those inside it: a
+        table's /Headers can be an array of its own object."""
+        stack = [container]
+        while stack:
+            item = stack.pop()
+            if item.is_indirect:
+                if item.objgen in swept:
+                    continue
+                swept.add(item.objgen)
+            keys = list(item.keys()) if isinstance(item, pikepdf.Dictionary) else range(len(item))
+            for key in keys:
+                value = item[key]
+                if isinstance(value, (pikepdf.Dictionary, pikepdf.Array)):
+                    stack.append(value)
+                elif key != "/Lang":
+                    sweep(item, key)
+
+    def drop(holder, *keys) -> None:
+        for key in keys:
+            if key in holder:
+                del holder[key]
+
+    def clean_property_list(props) -> None:
+        drop(props, *_REPLACEMENT_TEXT, "/AF")
+        sweep_all(props)
+
+    def tree_nodes(node):
+        """The nodes of a name or number tree, each once."""
+        stack, seen = [node], set()
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, pikepdf.Dictionary) or node.objgen in seen:
+                continue
+            if node.is_indirect:
+                seen.add(node.objgen)
+            yield node
+            if isinstance(kids := node.get("/Kids"), pikepdf.Array):
+                stack.extend(kids)
+
+    with _pikepdf_open(doc.tobytes()) as pdf:
+        root = pdf.Root
+        drop(root, "/OpenAction", "/AA", "/Dests")
+        if isinstance(names := root.get("/Names"), pikepdf.Dictionary):
+            drop(names, "/Dests")
+        threads = root.get("/Threads")
+        for thread in threads if isinstance(threads, pikepdf.Array) else ():
+            if not isinstance(thread, pikepdf.Dictionary):
+                continue
+            if isinstance(thread.get("/I"), pikepdf.Dictionary | pikepdf.Array):
+                sweep_all(thread.I)  # an article's /Title and /Author
+            else:
+                sweep(thread, "/I")
+        if isinstance(layers := root.get("/OCProperties"), pikepdf.Dictionary):
+            sweep_all(layers)  # each configuration's /Name and /Creator, group labels
+        for node in tree_nodes(root.get("/PageLabels")):
+            if isinstance(nums := node.get("/Nums"), pikepdf.Array):
+                for label in list(nums)[1::2]:
+                    if isinstance(label, pikepdf.Dictionary):
+                        sweep(label, "/P")
+
+        content_streams = list(pdf.pages)
+        for obj in pdf.objects:
+            if not isinstance(obj, pikepdf.Dictionary | pikepdf.Stream):
+                continue
+            kind, subtype = obj.get("/Type"), obj.get("/Subtype")
+            files = obj.get("/AF")
+            if isinstance(files, pikepdf.Array) and all(
+                isinstance(f, pikepdf.Dictionary | pikepdf.String) for f in files
+            ):  # a colour space called /AF is an array that starts with a name
+                del obj["/AF"]
+            if kind in ("/Page", "/Catalog") or isinstance(obj, pikepdf.Stream):
+                drop(obj, "/PieceInfo")  # a form's, and an image's: Illustrator keeps one there too
+            if kind == "/Page" or "/FT" in obj or ("/Rect" in obj and subtype is not None):
+                drop(obj, "/AA")
+            if kind in ("/OCG", "/OCMD"):  # a layer is a property list too
+                clean_property_list(obj)
+            for resources in (obj, obj.get("/Resources")):
+                props = resources.get("/Properties") if isinstance(
+                    resources, pikepdf.Dictionary | pikepdf.Stream) else None
+                for prop in props.values() if isinstance(props, pikepdf.Dictionary) else ():
+                    if isinstance(prop, pikepdf.Dictionary):
+                        clean_property_list(prop)
+            if isinstance(obj, pikepdf.Stream) and (
+                subtype == "/Form" or obj.get("/PatternType") == 1
+            ):
+                content_streams.append(obj)
+            procs = obj.get("/CharProcs") if subtype == "/Type3" else None
+            if isinstance(procs, pikepdf.Dictionary):
+                content_streams.extend(procs.values())
+
+        tree = root.get("/StructTreeRoot")
+        if isinstance(tree, pikepdf.Dictionary):
+            stack, seen = [tree.get("/K")], set()
+            for node in tree_nodes(tree.get("/ParentTree")):  # elements /K never reaches
+                if isinstance(nums := node.get("/Nums"), pikepdf.Array):
+                    stack.extend(list(nums)[1::2])
+            while stack:
+                _check_deadline(deadline)
+                elem = stack.pop()
+                if isinstance(elem, pikepdf.Dictionary | pikepdf.Array) and elem.is_indirect:
+                    if elem.objgen in seen:
+                        continue  # a /K array holding itself looped forever
+                    seen.add(elem.objgen)
+                if isinstance(elem, pikepdf.Array):
+                    stack.extend(elem)
+                if not isinstance(elem, pikepdf.Dictionary) or "/S" not in elem:
+                    continue  # a marked-content id or reference, not an element
+                drop(elem, *_REPLACEMENT_TEXT)
+                for key in ("/Alt", "/T", "/ID"):
+                    sweep(elem, key)
+                attributes = elem.get("/A")
+                if not isinstance(attributes, pikepdf.Array):
+                    attributes = [attributes]
+                for attribute in attributes:
+                    if isinstance(attribute, pikepdf.Dictionary):
+                        sweep_all(attribute)  # table /Headers name element ids
+                stack.append(elem.get("/K"))
+            for node in tree_nodes(tree.get("/IDTree")):
+                if isinstance(ids := node.get("/Names"), pikepdf.Array):
+                    for index in range(0, len(ids), 2):
+                        sweep(ids, index)
+                if isinstance(limits := node.get("/Limits"), pikepdf.Array):
+                    for index in range(len(limits)):
+                        sweep(limits, index)
+            if isinstance(classes := tree.get("/ClassMap"), pikepdf.Dictionary):
+                sweep_all(classes)  # attributes an element takes by its /C
+
+        for target in content_streams:
+            source = target.obj if isinstance(target, pikepdf.Page) else target
+            contents = source.get("/Contents") if isinstance(target, pikepdf.Page) else source
+            parts = contents if isinstance(contents, pikepdf.Array) else [contents]
+            size, marked = _scan_content(parts, deadline)
+            if not marked:
+                continue
+            if size > _MAX_PARSED_CONTENT_BYTES:
+                raise ApiError(
+                    422,
+                    "content_too_complex",
+                    "Este PDF tem uma página demasiado pesada para garantirmos que o texto "
+                    "censurado sai de todas as cópias. " + _REDACT_AS_IMAGES,
+                )
+            try:
+                instructions = list(pikepdf.parse_content_stream(target))
+            except Exception as exc:  # MuPDF draws past a bad token; pikepdf stops
+                raise _content_unreadable() from exc
+            changed = False
+            for index, instruction in enumerate(instructions):
+                operands = instruction.operands
+                if str(instruction.operator) in ("BDC", "DP") and operands and isinstance(
+                    operands[-1], pikepdf.Dictionary
+                ):
+                    before = operands[-1].unparse()
+                    clean_property_list(operands[-1])
+                    if operands[-1].unparse() != before:
+                        instructions[index] = pikepdf.ContentStreamInstruction(
+                            operands, instruction.operator
+                        )
+                        changed = True
+            if changed:
+                data = pikepdf.unparse_content_stream(instructions)
+                if isinstance(target, pikepdf.Page):
+                    source.Contents = pdf.make_stream(data)
+                else:
+                    target.write(data)
+
+        buf = io.BytesIO()
+        pdf.save(buf)
+    doc.close()
+    return pymupdf.open(stream=buf.getvalue(), filetype="pdf")
+
+
+def check_hidden_copies(doc, *, strategy: str, custom_text: str, regex_pattern: str) -> None:
+    """The preview runs the apply's hidden-copy pass on a copy of doc, so what
+    it refuses (content_unreadable, content_too_complex) is refused before the
+    customer pays, not after."""
+    pattern_str, flags = _compile_pattern(strategy, custom_text, regex_pattern)
+    copy = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    try:
+        deadline = time.monotonic() + REDACTION_SCAN_TIMEOUT_SECONDS
+        copy = _without_hidden_copies(copy, regex.compile(pattern_str, flags), deadline)
+    finally:
+        copy.close()
+
+
 def _without_xref_holes(doc):
     """scrub() reads every object number and raises on one no xref section
     defines. That is valid PDF — the object is null — and pyHanko-signed files
@@ -1912,6 +2784,9 @@ def redact_pdf(
             else:
                 matches_to_apply = all_matches
 
+            pattern_str, flags = _compile_pattern(strategy, custom_text, regex_pattern)
+            doc = _without_hidden_copies(doc, regex.compile(pattern_str, flags), deadline)
+
             if matches_to_apply:
                 pages_with_redactions = sorted({m.page for m in matches_to_apply})
                 _check_image_budget(doc, pages=pages_with_redactions)
@@ -1919,17 +2794,7 @@ def redact_pdf(
                 try:
                     for m in matches_to_apply:
                         doc[m.page].add_redact_annot(pymupdf.Rect(*m.bbox), fill=(0, 0, 0))
-
-                    for page_idx in pages_with_redactions:
-                        _check_deadline(deadline)
-                        page = doc[page_idx]
-                        jpeg_boxes = _jpeg_image_boxes(page)
-                        page.apply_redactions(
-                            images=pymupdf.PDF_REDACT_IMAGE_PIXELS,  # blank what the box covers
-                            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
-                            text=pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
-                        )
-                        _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
+                    _apply_redactions(doc, pages_with_redactions, deadline)
                 finally:
                     pymupdf.TOOLS.set_small_glyph_heights(False)
 
