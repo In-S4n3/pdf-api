@@ -14,6 +14,7 @@ from app.services.pdf_tools import (
     REDACTION_LOCK,
     _iter_matches,
     _open_pdf,
+    check_hidden_copies,
     compress_pdf,
     convert_pdf_to_pdfa,
     convert_to_pdf,
@@ -293,6 +294,9 @@ def _extract_matches_json(
                 _iter_matches(
                     doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern
                 )
+            )
+            check_hidden_copies(
+                doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern
             )
         for match in matches:
             total += 1

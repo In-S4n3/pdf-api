@@ -64,7 +64,8 @@ def test_redact_a_pdf_whose_xref_skips_an_object_number():
 
 def _copies_left(pdf: bytes, secret: str) -> list[int]:
     """Objects whose source or decoded stream still holds secret, as text or hex."""
-    needles = (secret.encode(), secret.encode().hex().encode(), secret.encode("utf-16-be"))
+    needles = (secret.encode(), secret.encode().hex().encode(), secret.encode("utf-16-be"),
+               secret.encode("utf-16-be").hex().encode())
     with pymupdf.open(stream=pdf, filetype="pdf") as doc:
         return [
             xref
