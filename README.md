@@ -56,15 +56,19 @@ V1, `/v2/echo` and `/v2/fill-form` stay mounted on purpose (decision of
 - Uploads up to 20 MiB; an oversized `Content-Length` or a missing/wrong key is
   refused before the body is read. Responses stop at 30 MiB (`output_too_large`):
   Cloud Run drops a non-streamed HTTP/1 response above 32 MiB.
-- OCR: at most 8 pages that need OCR per job, and at most 150 megapixels as
-  OCRmyPDF will render them — colour counts twice, a black-and-white (1-bit)
-  scan half, and any page with text or a drawing renders at 400 dpi. It runs 4
-  pages at a time, one per vCPU, so each worker gets at most 37.5 Mpx. On Cloud Run gen2 with 4 vCPU, 8 colour A4 scans
-  at 300 dpi (139 Mpx) take 28.5 s, 4 A4 photos with captions (124) ~40 s, and
-  8 A4 photos at 300 dpi sit at the 45 s tool budget. Too many pages answer
-  `too_many_pages` with the number that fits; one page above 37.5 Mpx (an A3
-  colour page with text) answers `page_too_large`. Born-digital pages are
-  skipped; a file with nothing to recognise answers `already_searchable`.
+- OCR (the only tool with a long budget: ocrmypdf is killed at 200 s, every
+  other tool at 45 s; Cloud Run's request timeout is 285 s): at most 28 pages
+  that need OCR per job, and at most 420 megapixels as OCRmyPDF will render
+  them — colour counts twice, a black-and-white (1-bit) scan half, and any page
+  with text or a drawing renders at 400 dpi. It runs 4 pages at a time, one per
+  vCPU, so each worker gets at most 105 Mpx: 28 grey A4 scans at 300 dpi, 24
+  colour ones, or 12 A4 photos with captions. A page counts at least 15 Mpx
+  (a Tesseract round), so a huge page cannot hide 27 small ones. The measurements and arithmetic
+  are in `pdf_tools.py`. Too many pages answer `too_many_pages` with the number
+  that fits; one page above 105 Mpx (an A1 colour scan at 300 dpi) answers
+  `page_too_large`.
+  Born-digital pages are skipped; a file with nothing to recognise answers
+  `already_searchable`.
 - Rendering (PDF to image) stays within 40 Mpx per page: 300 dpi up to A2, less
   for larger pages. Embedded images above 150 Mpx are refused (`image_too_large`).
 - Protect passwords are at most 127 UTF-8 bytes — every PDF reader truncates there.

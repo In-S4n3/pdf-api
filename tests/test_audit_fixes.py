@@ -505,8 +505,8 @@ def _ocr_calls(monkeypatch) -> list:
     got past every OCR limit."""
     calls = []
 
-    def record(command, **_kwargs):
-        calls.append(command)
+    def record(command, **kwargs):
+        calls.append((command, kwargs["timeout"]))
         raise ApiError(503, "tool_unavailable", "stub")
 
     monkeypatch.setattr(pdf_tools, "_run_command", record)
@@ -530,28 +530,62 @@ def _colour_scan_page(doc) -> None:
     page.insert_image(page.rect, stream=jpeg.getvalue())
 
 
+def _grey_a4_scan_page(doc) -> None:
+    """An A4 page holding a 300 dpi DeviceGray scan and no text: 8.7 Mpx."""
+    jpeg = io.BytesIO()
+    Image.new("L", (2480, 3508), 230).save(jpeg, "JPEG")
+    page = doc.new_page(width=595, height=842)
+    xref = page.insert_image(page.rect, stream=jpeg.getvalue())
+    doc.xref_set_key(xref, "ColorSpace", "/DeviceGray")  # MuPDF attaches an ICC profile
+
+
 def test_ocr_budgets_the_pixels_not_only_the_pages(client, monkeypatch):
-    """ENGINE R2 (P2): six photo pages with captions sat under the page cap and
-    took 31 s on the 2 CPU bench (≈55 s on Cloud Run, past the 45 s kill):
-    OCRmyPDF renders a page with any text at 400 dpi, in colour."""
+    """ENGINE R2 (P2): photo pages with captions sat under the page cap and ran
+    past the kill: OCRmyPDF renders a page with any text at 400 dpi, in colour
+    (30.9 Mpx). Three fit a worker's 105 Mpx, so 12 fit the job."""
     monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
-    response = _post(client, "ocr", _photo_pages(5).tobytes(), {"language": "portuguese"})
+    response = _post(client, "ocr", _photo_pages(13).tobytes(), {"language": "portuguese"})
     assert response.status_code == 422
     assert _error(response)["code"] == "too_many_pages"
-    assert "até 4 páginas" in _error(response)["message"]
+    assert "até 12 páginas" in _error(response)["message"]
     assert "Extrair PDF" in _error(response)["message"]
 
 
-def test_ocr_budget_still_takes_eight_ordinary_scans(client, monkeypatch):
-    """The pixel budget must not undercut the page cap for the scans it was
-    measured on: 8 colour A4 pages at 300 dpi, no text (28.5 s on Cloud Run
-    gen2 with 4 vCPU; a 504 at 45 s on 2 vCPU)."""
+def test_ocr_takes_24_colour_scans_and_refuses_25(client, monkeypatch):
+    """Colour A4 scans at 300 dpi (17.4 Mpx): 28 dense with text ran 41 s on an
+    M4, ≈203 s on Cloud Run, past the 200 s kill. Six per worker fit; a seventh
+    on one worker does not."""
     calls = _ocr_calls(monkeypatch)
     doc = pymupdf.open()
-    for _ in range(8):
+    for _ in range(24):
         _colour_scan_page(doc)
     _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
+    assert [timeout for _, timeout in calls] == [pdf_tools.OCR_SUBPROCESS_TIMEOUT]
+
+    _colour_scan_page(doc)
+    response = _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
+    assert response.status_code == 422
+    assert "até 24 páginas" in _error(response)["message"]
+    assert len(calls) == 1
+
+
+def test_ocr_takes_28_grey_scans_and_refuses_29(client, monkeypatch):
+    """2026-10-08: a 25-page scan from Brazil was refused at 8 pages. Grey A4
+    scans at 300 dpi dense with text: 25 ran 35 s on an M4 (≈176 s on Cloud
+    Run), 60 ran 66 s (≈330 s). Seven rounds of four fit the 200 s kill."""
+    calls = _ocr_calls(monkeypatch)
+    doc = pymupdf.open()
+    for _ in range(28):
+        _grey_a4_scan_page(doc)
+    _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
     assert calls
+
+    _grey_a4_scan_page(doc)
+    response = _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
+    assert response.status_code == 422
+    assert _error(response)["code"] == "too_many_pages"
+    assert "até 28 páginas" in _error(response)["message"]
+    assert len(calls) == 1
 
 
 def test_ocr_takes_four_photo_pages_with_captions(client, monkeypatch):
@@ -564,28 +598,52 @@ def test_ocr_takes_four_photo_pages_with_captions(client, monkeypatch):
 
 
 def test_ocr_refuses_a_page_one_worker_cannot_finish(client, monkeypatch):
-    """A page never splits across workers. An A3 photo with a caption renders
-    61.9 Mpx, two workers' share (≈60 s on one Cloud Run vCPU, past the 45 s
-    kill); a cap of half the budget let it through."""
+    """A page never splits across workers. An A1 photo with a caption renders
+    247.6 Mpx, over two workers' share (≈320 s on one Cloud Run vCPU, past the
+    200 s kill); a cap of half the budget let such a page through."""
     monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
     doc = _photo_pages(1)
-    doc[0].set_mediabox(pymupdf.Rect(0, 0, 842, 1191))  # A3
+    doc[0].set_mediabox(pymupdf.Rect(0, 0, 1684, 2384))  # A1
     response = _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
     assert response.status_code == 422
     assert _error(response)["code"] == "page_too_large"
 
 
 def test_ocr_budgets_the_busiest_worker_not_the_total(client, monkeypatch):
-    """Four photo pages fill the four workers (39-40 s on Cloud Run); a fifth
-    waits for one to free up, then runs ~15 s more, past the 45 s kill —
-    though the total, 141 Mpx, is under the 150 budget."""
+    """Twelve photo pages fill the four workers (92.8 Mpx each); a colour scan
+    waits for one to free up and takes it to 110.2, past its 105 — though the
+    total, 389 Mpx, is under the 420 budget."""
     monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
-    doc = _photo_pages(4)
+    doc = _photo_pages(12)
     _colour_scan_page(doc)
     response = _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
     assert response.status_code == 422
     assert _error(response)["code"] == "too_many_pages"
-    assert "até 4 páginas" in _error(response)["message"]
+    assert "até 12 páginas" in _error(response)["message"]
+
+
+def test_ocr_prices_small_pages_at_their_share_of_the_page_cap(client, monkeypatch):
+    """An A3 photo (61.9 Mpx) holds one worker while 27 grey pages, 8.7 Mpx
+    each, sit under both caps — yet each costs a Tesseract round (~25 s), and
+    the other three workers got nine apiece (~225 s), past the 200 s kill."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    doc = _photo_pages(1)
+    doc[0].set_mediabox(pymupdf.Rect(0, 0, 842, 1191))  # A3
+    for _ in range(27):
+        _grey_a4_scan_page(doc)
+    response = _post(client, "ocr", doc.tobytes(), {"language": "portuguese"})
+    assert response.status_code == 422
+    assert _error(response)["code"] == "too_many_pages"
+
+
+def test_tesseract_cannot_skip_a_page_before_the_job_is_killed(client, monkeypatch):
+    """ocrmypdf ships a page whose Tesseract timed out without text and still
+    succeeds; with the page timeout at the subprocess kill, the kill comes first."""
+    calls = _ocr_calls(monkeypatch)
+    _post(client, "ocr", _photo_pages(1).tobytes(), {"language": "portuguese"})
+    command = calls[0][0]
+    flag = command.index("--tesseract-timeout")
+    assert int(command[flag + 1]) >= pdf_tools.OCR_SUBPROCESS_TIMEOUT
 
 
 def test_ocr_runs_one_worker_per_cloud_run_vcpu():

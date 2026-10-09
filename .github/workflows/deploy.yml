@@ -67,7 +67,7 @@ jobs:
           service: "${{ env.SERVICE }}"
           region: "${{ env.REGION }}"
           image: "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }}"
-          timeout: 60s
+          timeout: 285s  # above OCR_SUBPROCESS_TIMEOUT; same as service.yaml
           env_vars: |-
             ENVIRONMENT=production
             STRICT_API_KEY=true

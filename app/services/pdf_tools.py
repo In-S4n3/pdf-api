@@ -135,19 +135,44 @@ LANGUAGE_MAP = {
 # OCR_JOBS equal to --cpu in .github/workflows/deploy.yml and service.yaml.
 OCR_JOBS = 4
 OCR_FLAGS = ("--output-type", "pdf", "--optimize", "0", "--jobs", str(OCR_JOBS), "--rotate-pages")
-MAX_OCR_PAGES = 8  # two rounds of OCR_JOBS
+# OCR alone gets a long budget: real 25-page scans were refused at 8 pages, and
+# TudoPDF waits longer for OCR only (proxy 280 s → browser 290 s → Vercel 300 s;
+# Cloud Run timeoutSeconds 285, which a test holds above this). Every other tool keeps
+# TOOL_SUBPROCESS_TIMEOUT. The 80 s left cover cold start (~25 s), upload,
+# the checks before ocrmypdf and TudoPDF's preview.
+OCR_SUBPROCESS_TIMEOUT = 200
 # The pages cap alone let 6 photo pages with captions through: OCRmyPDF renders
 # any page with text or a vector drawing — a scanner's footer is enough — at
 # 400 dpi, and the time goes into writing those pixels as PNG, twice per page.
 # So the pixels it will render are budgeted too, colour counting twice
 # (_ocr_megapixels). A page never splits and waits for a free worker, so the
 # busiest worker sets the time: it may render MAX_OCR_MEGAPIXELS / OCR_JOBS.
-# Seconds of processing on Cloud Run gen2, 4 vCPU / 4 GiB, 2026-09-24:
-#   8 grey A4 scans (69.6 Mpx) 17 · 8 colour A4 scans (139.3) 28.5
-#   4 A4 photos with captions (123.7) 39-40 · 8 A4 photos at 300 dpi (139.3) ~45
-# The last sits at the 45 s kill. Gen1 on 2 vCPU ran ~3x slower than the 2 CPU
-# bench box and cut 8 colour scans at 45 s; gen2 alone gained only 11-20 %.
-MAX_OCR_MEGAPIXELS = 150
+# Seconds of processing on Cloud Run gen2, 4 vCPU / 4 GiB, 2026-09-24
+# (Mpx total; busiest worker):
+#   8 grey A4 scans (69.6; 17.4) 17 · 8 colour A4 scans (139.3; 34.8) 28.5
+#   4 A4 photos with captions (123.7; 30.9) 39-40 · 8 A4 photos at 300 dpi (139.3; 34.8) ~45
+# Gen1 on 2 vCPU ran ~3x slower than the 2 CPU bench box and cut 8 colour scans
+# at 45 s; gen2 alone gained only 11-20 %.
+# Those pages carry little text. Pages dense with text (~600 words, 300 dpi),
+# 2026-10-08 on an M4 under docker --cpus=4 --memory=4g, /tmp in RAM:
+#   grey 25 pages 35 s · 60 pages 66 s · colour 16 pages 27 s · 28 pages 41 s
+# The two cases above ran 4.2x (photos, 9.5 s) and 5.0x (colour, 5.7 s) slower
+# on Cloud Run than there, so x5. Tesseract sets the time on such pages: a grey
+# page costs nearly a colour one, so pixels alone under-price it.
+# Sizing at x5, 10 % under the kill (180 s):
+#   colour: 41 x 5 / 121.8 Mpx busiest = 1.67 s/Mpx, slower than photos (1.29)
+#     180 / 1.67 = 108 Mpx per worker → 105 → MAX_OCR_MEGAPIXELS = 4 x 105 = 420
+#     (24 colour A4 scans, 6 rounds; 12 photo pages)
+#   grey: 35 x 5 / 7 rounds (25 pages) = 25 s per round
+#     180 / 25 = 7.2 rounds → 7 → MAX_OCR_PAGES = 4 x 7 = 28 (1-bit scans too)
+# The 1.29 s/Mpx alone gave 60 pages / 540 Mpx: 60 grey pages ≈ 330 s here.
+MAX_OCR_MEGAPIXELS = 420
+MAX_OCR_PAGES = 28
+# A page costs a round of Tesseract however few pixels it has, so it counts at
+# least its share of the page cap (15 Mpx). Without that floor one A3 photo plus
+# 27 grey pages fit both caps, yet left three workers nine grey pages each
+# (~225 s), past the kill.
+OCR_PAGE_FLOOR_MEGAPIXELS = MAX_OCR_MEGAPIXELS / MAX_OCR_PAGES
 # Hand Tesseract at most ~A4 at 300 dpi; the 400 dpi renders above it only
 # cost time (31 → 25 s on those photo pages). Scans up to 300 dpi are untouched.
 OCR_DOWNSAMPLE_FLAGS = (
@@ -155,6 +180,10 @@ OCR_DOWNSAMPLE_FLAGS = (
     "--tesseract-downsample-above",
     "3600",
 )
+# When Tesseract gives up on a page, ocrmypdf ships that page without text and
+# calls the job a success. Its timeout at the subprocess kill means a slow page
+# ends the whole job with our typed timeout instead.
+OCR_TESSERACT_TIMEOUT_FLAGS = ("--tesseract-timeout", str(OCR_SUBPROCESS_TIMEOUT))
 
 CONFORMANCE_MAP = {
     "pdfa-1b": "1",
@@ -1685,11 +1714,12 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 "Este PDF tem páginas demasiado grandes ou com resolução demasiado alta "
                 "para OCR.",
             )
-        if _busiest_ocr_worker(megapixels) > worker_budget:
+        costs = [max(mpx, OCR_PAGE_FLOOR_MEGAPIXELS) for mpx in megapixels]
+        if _busiest_ocr_worker(costs) > worker_budget:
             fit = sum(
                 1
                 for n in range(1, len(pages) + 1)
-                if _busiest_ocr_worker(megapixels[:n]) <= worker_budget
+                if _busiest_ocr_worker(costs[:n]) <= worker_budget
             )
             raise ApiError(
                 422,
@@ -1718,13 +1748,14 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 mode,
                 *OCR_FLAGS,
                 *OCR_DOWNSAMPLE_FLAGS,
+                *OCR_TESSERACT_TIMEOUT_FLAGS,
                 "-l",
                 lang_code,
                 *([] if all_pages else ["--pages", ",".join(map(str, pages))]),
                 str(input_path),
                 str(output_path),
             ],
-            timeout=TOOL_SUBPROCESS_TIMEOUT,
+            timeout=OCR_SUBPROCESS_TIMEOUT,
             tmpdir=tmpdir,
         )
 
