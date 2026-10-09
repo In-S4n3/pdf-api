@@ -1,6 +1,9 @@
 # Cloud Run config for pdf-api (europe-west1). Apply with:
 #   gcloud run services replace service.yaml --region=europe-west1
 # pdf-para-word (pdf2docx + opencv) needs the 2Gi/concurrency=1 floor or it OOMs.
+# timeoutSeconds sits above OCR_SUBPROCESS_TIMEOUT (200 s) and TudoPDF's 280 s proxy
+# (so the proxy's own timeout message reaches the user), and under its 300 s Vercel
+# route; every other tool still stops itself at 45 s.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -12,7 +15,7 @@ spec:
         run.googleapis.com/execution-environment: gen2
     spec:
       containerConcurrency: 1
-      timeoutSeconds: 60
+      timeoutSeconds: 285
       containers:
         - image: IMAGE_PLACEHOLDER  # set by the deploy pipeline
           resources:
