@@ -4,6 +4,7 @@ FastAPI application factory with lifespan management and error handling.
 """
 
 import logging
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -19,6 +20,7 @@ from app.auth import check_api_key
 from app.config import DEBUG, get_settings
 from app.http_utils import upload_too_large_message
 from app.router import router
+from app.services.pdf_tools import CALLER_GONE, CANCEL_CHECK_URL
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,9 @@ async def _reject_before_body(request: Request):
 async def request_id_middleware(request: Request, call_next):
     """Attach a request id to every response for easier debugging."""
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    # Read by _spawn in the worker thread: call_next and the threadpool copy this context.
+    CANCEL_CHECK_URL.set(request.headers.get("X-Cancel-Check"))
+    CALLER_GONE.set(threading.Event())
     try:
         response = await _reject_before_body(request) or await call_next(request)
     except Exception:
