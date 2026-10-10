@@ -1688,8 +1688,8 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 422,
                 "too_many_pages",
                 f"Este PDF tem {len(pages)} páginas para reconhecer e o OCR processa até "
-                f"{MAX_OCR_PAGES} de cada vez. Separe-as com a ferramenta Extrair PDF, "
-                f"até {MAX_OCR_PAGES} páginas de cada vez, e processe cada parte.",
+                f"{MAX_OCR_PAGES} páginas de cada vez. Na ferramenta Dividir PDF, escolha "
+                f"«A cada N páginas», escreva {MAX_OCR_PAGES} e processe cada parte.",
             )
         # --redo-ocr strips invisible text from the page's own content only, and
         # OCRmyPDF keeps its layer in a Form XObject (/OCR- + Name.random's 22
@@ -1725,9 +1725,8 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 422,
                 "too_many_pages",
                 f"Este PDF tem {len(pages)} páginas para reconhecer, a cores ou em alta "
-                f"resolução, e o OCR processa até {fit} páginas assim de cada vez. "
-                f"Separe-as com a ferramenta Extrair PDF, até {fit} de cada vez, e "
-                "processe cada parte.",
+                f"resolução, e o OCR processa até {fit} páginas de cada vez. Na ferramenta Dividir "
+                f"PDF, escolha «A cada N páginas», escreva {fit} e processe cada parte.",
             )
         _check_image_budget(doc, pages=[pno - 1 for pno in pages])
         all_pages = len(pages) == doc.page_count
