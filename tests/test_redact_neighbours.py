@@ -262,13 +262,184 @@ def test_an_ocr_layer_keeps_the_whole_box_over_the_scan(watermark):
     output = redact_pdf(scan.tobytes(), strategy="email")
     with pymupdf.open(stream=output, filetype="pdf") as doc:
         pix = pymupdf.Pixmap(doc, doc[0].get_images()[0][0])
-        # Over an image the box keeps PyMuPDF's stroke, over the edge of what it blanks.
-        assert "fs" in [d["type"] for d in doc[0].get_drawings()]
+        # The black box blanks no pixel (the whole box did): unstroked, as over no image.
+        assert [d["type"] for d in doc[0].get_drawings()] == ["f"]
     scale = pix.width / 300
     dark = sum(pix.pixel(int(x * scale), int(y * scale))[0] < 128
                for x in range(int(ink.x0) + 1, int(ink.x1))
                for y in range(int(ink.y0) + 1, int(ink.y1)))
     assert dark == 0
+
+
+def _grey(width: int, height: int) -> pymupdf.Pixmap:
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, width, height), False)
+    pix.clear_with(230)
+    return pix
+
+
+_NEIGHBOURS = ["Contact Cont", "Ana Silva", "cial today", "gypsy jig"]
+_WITHOUT = ["Contact Cont", "Ana", "cial today", "gypsy jig"]
+
+
+def _over_an_image(lines: list[str], image: str, leading: float) -> bytes:
+    """lines in 12 pt Helvetica over a grey letterhead filling the page, or
+    beside a 10 pt logo drawn after them, its edge over the end of «Silva».
+    A pixel per point at least: MuPDF blanks every pixel a box touches."""
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        if image == "letterhead":
+            page.insert_image(page.rect, pixmap=_grey(612, 792))
+        for i, line in enumerate(lines):
+            page.insert_text((72, 100 + i * leading), line, fontsize=12)
+        if image == "logo":
+            end = 72 + pymupdf.get_text_length("Ana Silva", fontsize=12)
+            page.insert_image(pymupdf.Rect(end - 2, 92 + leading, end + 8, 102 + leading),
+                              pixmap=_grey(40, 40))
+        return doc.tobytes()
+
+
+@pytest.mark.parametrize("image", ["letterhead", "logo"])
+@pytest.mark.parametrize("leading", [7, 9, 12, 14.4])
+def test_visible_text_over_an_image_keeps_the_lines_beside_it(image, leading):
+    """Over an image the box was kept whole, and took «tact C» and «oday» on
+    normal 14.4 pt leading, even from a 10 pt logo touching the end of
+    «Silva». And the page as a reader sees it: nothing darker than the page
+    drawn with no «Silva» at all, outside the black box — no ink of the match
+    left, and no stroke over the neighbours' (it blackened the letters above
+    on 7 and 9 pt leading). The image is blanked, lighter, under the whole
+    box."""
+    source = _over_an_image(_NEIGHBOURS, image, leading)
+    with pymupdf.open(stream=source, filetype="pdf") as doc:
+        assert doc[0].get_image_info(), "fixture must draw an image"
+    output = redact_pdf(source, strategy="custom", custom_text="Silva")
+    assert _lines(output) == _WITHOUT
+    _no_match_survives(output, "Silva")
+
+    clip = pymupdf.Rect(60, 80, 220, 110 + 3 * leading)
+    with (pymupdf.open(stream=output, filetype="pdf") as doc,
+          pymupdf.open(stream=_over_an_image(_WITHOUT, image, leading)) as without):
+        (box,) = [(d["rect"], d["fill"]) for d in doc[0].get_drawings()]
+        shown, expected = (d[0].get_pixmap(dpi=288, clip=clip) for d in (doc, without))
+    assert box[1] == (0, 0, 0)
+    painted = (box[0] - (clip.x0, clip.y0, clip.x0, clip.y0)) * 4 + (-1, -1, 1, 1)  # antialiased
+    n, width, ours, theirs = shown.n, shown.width, shown.samples, expected.samples
+    darker = [pymupdf.Point(i // n % width, i // n // width) for i in range(0, len(ours), n)
+              if ours[i] < theirs[i] - 16]
+    assert darker and all(point in painted for point in darker)
+
+
+def _scan_of(lines: list[str], leading: float) -> pymupdf.Pixmap:
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        for i, line in enumerate(lines):
+            page.insert_text((72, 100 + i * leading), line, fontsize=12)
+        return page.get_pixmap(dpi=144, colorspace=pymupdf.csGRAY)
+
+
+def _text_over_a_scan(lines: list[str], layer: str, leading: float) -> bytes:
+    """A scan of _NEIGHBOURS with lines laid over it the ways OCR tools do:
+    hidden (3 Tr), white, or both on the same origins."""
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_image(page.rect, pixmap=_scan_of(_NEIGHBOURS, leading))
+        for i, line in enumerate(lines):
+            if layer in ("hidden", "twin"):
+                page.insert_text((72, 100 + i * leading), line, fontsize=12, render_mode=3)
+            if layer in ("white", "twin"):
+                page.insert_text((72, 100 + i * leading), line, fontsize=12, color=(1, 1, 1))
+        return doc.tobytes()
+
+
+def _dark_pixels(pdf: bytes, clip: pymupdf.Rect) -> int:
+    """Dark pixels of the page's first image, within clip (page points)."""
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        page = doc[0]
+        pix = pymupdf.Pixmap(doc, page.get_images()[0][0])
+        place = page.get_image_rects(page.get_images()[0][0])[0]
+    sx, sy = pix.width / place.width, pix.height / place.height
+    return sum(pix.pixel(int((x - place.x0) * sx), int((y - place.y0) * sy))[0] < 128
+               for x in range(int(clip.x0) + 1, int(clip.x1))
+               for y in range(int(clip.y0) + 1, int(clip.y1)))
+
+
+@pytest.mark.parametrize("layer", ["hidden", "white", "twin"])
+@pytest.mark.parametrize("leading", [7, 12, 14.4])
+def test_text_over_a_scan_keeps_its_neighbours_and_blanks_the_match(layer, leading):
+    """Over a scan the box was kept whole, so that it blanked the scan's
+    pixels: the OCR text beside it lost «tact C» and «oday». Now the text goes
+    under the box that spares its neighbours, the pixels under the whole box:
+    no ink of «Silva» is left in the scan. A white or twinned OCR layer is
+    text a reader does not see either."""
+    source = _text_over_a_scan(_NEIGHBOURS, layer, leading)
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_text((72, 100 + leading), "Ana Silva", fontsize=12)
+        ink = page.search_for("Silva")[0]
+    assert _dark_pixels(source, ink) > 50, "fixture must show «Silva» in the scan"
+    output = redact_pdf(source, strategy="custom", custom_text="Silva")
+    assert _lines(output) == _lines(_text_over_a_scan(_WITHOUT, layer, leading))
+    _no_match_survives(output, "Silva")
+    assert _dark_pixels(output, ink) == 0
+
+
+def _as_image_mask(text: pymupdf.Document, pix: pymupdf.Pixmap) -> bytes:
+    """text's page with pix drawn over it as a 1-bit image mask, as a
+    black-and-white scan often is: get_image_info lists it, get_bboxlog
+    calls it fill-imgmask."""
+    rows = []
+    for y in range(pix.height):
+        row = "".join("0" if v < 128 else "1" for v in pix.samples[y * pix.width:][:pix.width])
+        row += "1" * (-len(row) % 8)
+        rows.append(int(row, 2).to_bytes(len(row) // 8, "big"))
+    with pikepdf.open(io.BytesIO(text.tobytes())) as pdf:
+        page = pdf.pages[0]
+        page.Resources.XObject = Dictionary(Scan=pdf.make_stream(
+            b"".join(rows), Type=Name.XObject, Subtype=Name.Image, Width=pix.width,
+            Height=pix.height, ImageMask=True, BitsPerComponent=1))
+        page.contents_add(pdf.make_stream(b"0 g q 300 0 0 150 0 0 cm /Scan Do Q"))
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+
+@pytest.mark.parametrize("cover", ["page", "half", "top", "mask"])
+def test_text_an_image_is_drawn_over_keeps_the_whole_box_over_its_pixels(cover):
+    """Visible glyphs an image is drawn over are not what a reader sees: the
+    image is, and may show the match. Some scanners lay the scan over its
+    text. Its pixels are blanked under the whole box, also where the image
+    covers half the email, or a stripe over the top of its letters: trimmed
+    there, the box left the tops of the email's letters in the scan."""
+    lines = ["Contact Cont", "ana@example.com", "gypsy jig"]
+    with pymupdf.open() as text:
+        page = text.new_page(width=300, height=150)
+        for i, line in enumerate(lines):
+            page.insert_text((20, 40 + 16 * i), line, fontsize=14)
+        ink = page.search_for("ana@example.com")[0]
+        scan = pymupdf.Rect(0, 0, 300, 150)
+        if cover == "half":
+            scan.x0 = ink.x0 + ink.width / 2
+        if cover == "top":
+            scan.y1 = ink.y0 + ink.height / 2  # above the glyphs' middle
+        pix = page.get_pixmap(dpi=150, colorspace=pymupdf.csGRAY, clip=scan)
+        if cover == "mask":
+            source = _as_image_mask(text, pix)
+        else:
+            page.insert_image(scan, pixmap=pix)  # drawn after the text, over it
+            source = text.tobytes()
+
+    def ink_left(pdf: bytes) -> int:
+        with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+            pix = pymupdf.Pixmap(doc, doc[0].get_images()[0][0])
+        scale = pix.width / scan.width
+        return sum((pix.pixel(int((x - scan.x0) * scale), int((y - scan.y0) * scale))[0] < 128)
+                   != (cover == "mask")
+                   for x in range(int(max(ink.x0, scan.x0)) + 1, int(ink.x1))
+                   for y in range(int(ink.y0) + 1, int(min(ink.y1, scan.y1))))
+
+    assert ink_left(source) > 50, "fixture must show the email in the image"
+    output = redact_pdf(source, strategy="email")
+    _no_match_survives(output, "ana@example.com")
+    assert ink_left(output) == 0
 
 
 def test_glyphs_under_actual_text_that_differs_still_go():

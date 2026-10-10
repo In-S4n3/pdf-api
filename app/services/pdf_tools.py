@@ -254,6 +254,9 @@ class RedactionMatch:
     kind: str            # 'email' | 'phone' | 'custom' | 'regex'
     context: str         # word text inside the bbox (visible in UI)
     full_match: str      # the entire regex match (may span multiple words)
+    # Where it blanks an image's pixels: the box before it spared the glyphs
+    # beside it, which the image may show the match under (redact_pdf).
+    pixel_bbox: tuple[float, float, float, float] | None = None
 
 
 def _make_match(
@@ -262,6 +265,7 @@ def _make_match(
     bbox: tuple[float, float, float, float],
     context: str,
     full_match: str,
+    pixel_bbox: tuple[float, float, float, float] | None = None,
 ) -> RedactionMatch:
     """Build a RedactionMatch with a deterministic 16-char hex ID.
 
@@ -275,7 +279,7 @@ def _make_match(
     ).hexdigest()[:16]
     return RedactionMatch(
         id=digest, page=page_idx, bbox=bbox, kind=strategy,
-        context=context, full_match=full_match,
+        context=context, full_match=full_match, pixel_bbox=pixel_bbox,
     )
 
 
@@ -415,13 +419,12 @@ def _iter_matches(
                 _check_image_budget(doc, pages=[page_idx])
             inline = _inline_images_in_shared_forms(doc, page_idx, form_pages) if searches else []
             in_pixels = _in_pixels(trace)
-            images = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()] if searches else []
             covered = []  # boxes that may cover the match in an image's pixels too
             matched: dict = {}  # per view, read once the page has a match
             for view, needle in searches:
                 _check_deadline(deadline, _SCAN_TIMEOUT_MESSAGE)
                 if view not in matched:
-                    matched[view] = _where_it_matches(page, compiled_pattern, view, images)
+                    matched[view] = _where_it_matches(page, compiled_pattern, view)
                 where, across = matched[view]
                 hits = page.search_for(needle, flags=_SEARCH_FLAGS | view)
                 for rect in hits + across.get(needle.translate(_ASCII_LOWER), []):
@@ -445,9 +448,9 @@ def _iter_matches(
                             [(w[0], w[1], w[2], w[3], w[4]) for w in clipped]
                             or [(rect.x0, rect.y0, rect.x1, rect.y1, needle)]
                         )
-                    for x0, y0, x1, y1, word_text in words:
+                    for x0, y0, x1, y1, word_text, *whole in words:
                         bbox = (x0, y0, x1, y1)
-                        match = _make_match(strategy, page_idx, bbox, word_text, needle)
+                        match = _make_match(strategy, page_idx, bbox, word_text, needle, *whole)
                         if match.id in seen_ids:
                             continue
                         seen_ids.add(match.id)
@@ -459,7 +462,7 @@ def _iter_matches(
             search_doc.close()
 
 
-def _where_it_matches(page, compiled_pattern, view: int, images: list):
+def _where_it_matches(page, compiled_pattern, view: int):
     """Where a search_for hit is the match: the box of each of its words, []
     if the hit is not the match, None if no glyph lies under it. And, per
     match, the hits search_for cannot find: a line each for a match across a
@@ -480,9 +483,11 @@ def _where_it_matches(page, compiled_pattern, view: int, images: list):
     as PyMuPDF places it and as MuPDF does: for a font whose ascender and
     descender span less than 1 em, PyMuPDF moves the box, and a Type3
     «Silva» drawn above its baseline kept every glyph. Then the box spares the
-    glyphs around it (_spare_neighbours) — but not over an image, whose pixels
-    it blanks too: moved off the OCR line above, it left the tops of the
-    email's letters in the scan.
+    glyphs around it (_spare_neighbours), over an image too: kept whole there,
+    it took «tact C» and «oday» from the lines beside on normal leading. Each
+    box comes with the whole one, which blanks an image's pixels: moved off
+    the OCR line above, the box left the tops of the email's letters in the
+    scan (redact_pdf).
     """
 
     def lines_of(raw) -> list:
@@ -598,7 +603,8 @@ def _where_it_matches(page, compiled_pattern, view: int, images: list):
             for i in run:
                 box |= glyphs[i][0]
                 box |= glyphs[i][1] or box
-            if known(held) and not any(box.intersects(image) for image in images):
+            whole = (box.x0, box.y0, box.x1, box.y1)  # what blanks an image's pixels
+            if known(held):
                 near = [j for line_box, start, end, _ in lines
                         if line_box.intersects(box) for j in range(start, end)
                         if j not in held and glyphs[j][1] is not None and not text[j].isspace()]
@@ -607,7 +613,7 @@ def _where_it_matches(page, compiled_pattern, view: int, images: list):
                 others = [glyphs[j][1] * turn for j in near]
                 box = _spare_neighbours(box * turn, mine, others)
                 box = _clear_of_neighbours(box, mine, others) * ~turn
-            boxes.append((box.x0, box.y0, box.x1, box.y1, "".join(text[i] for i in run)))
+            boxes.append((box.x0, box.y0, box.x1, box.y1, "".join(text[i] for i in run), whole))
         return boxes
 
     return words, across
@@ -2718,7 +2724,10 @@ def _image_placements(page, among: set[int], *, turned: bool = False) -> dict[in
     return placements
 
 
-def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False) -> None:
+def _apply_redactions(
+    doc, page_numbers, deadline: float, *, marks: bool = False,
+    text: int = pymupdf.PDF_REDACT_TEXT_REMOVE,
+) -> None:
     """apply_redactions on these pages, and what it blanks in a scan blanked
     wherever the scan is drawn.
 
@@ -2773,7 +2782,7 @@ def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False
             held_back.append((page_idx, [(annot.rect, _redact_keys(annot)) for annot in later]))
             for annot in later:
                 page.delete_annot(annot)
-        _redact_page(page)
+        _redact_page(page, text=text)
         if not shared:
             continue
         page = doc.reload_page(page)  # get_image_rects caches where images were
@@ -2809,29 +2818,30 @@ def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False
         page = doc.reload_page(doc[page_idx])  # get_image_info caches where images were
         for rect, keys in kept:
             _add_redaction(page, rect, keys)
-        _redact_page(page)
+        _redact_page(page, text=text)
 
 
-def _redact_page(page) -> None:
+def _redact_page(
+    page, *, images: int = pymupdf.PDF_REDACT_IMAGE_PIXELS,  # blank what the box covers
+    text: int = pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
+) -> None:
     jpeg_boxes = _jpeg_image_boxes(page)
-    _paint_boxes(page)
-    page.apply_redactions(
-        images=pymupdf.PDF_REDACT_IMAGE_PIXELS,  # blank what the box covers
-        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
-        text=pymupdf.PDF_REDACT_TEXT_REMOVE,  # explicit: delete characters
-    )
+    _paint_boxes(page, blanks=images != pymupdf.PDF_REDACT_IMAGE_NONE)
+    page.apply_redactions(images=images, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE, text=text)
     _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
 
 
-def _paint_boxes(page) -> None:
+def _paint_boxes(page, *, blanks: bool) -> None:
     """Paint the redaction boxes here; apply_redactions paints none of them.
 
     apply_redactions fills each box and strokes it in the fill colour, 1 pt
     wide: half a point past every edge, a black rule under «5 de Outubro» on
     the line above a redacted phone in a real footer. So a box over no image
-    is painted without it. Over an image the stroke stays: it covers the edge
-    of what the box blanks. Painted before apply_redactions, under any overlay
-    text PyMuPDF writes after it.
+    is painted without it. Over an image the stroke stays where the box blanks
+    its pixels: it covers the edge of what it blanks. redact_pdf's black boxes
+    blank none (the whole box did, unpainted): stroked, they blackened the
+    letters above on 7 pt leading. Painted before apply_redactions, under any
+    overlay text PyMuPDF writes after it.
 
     Painted unturned, as every box here is: on a turned page PyMuPDF's shape
     drops the CropBox offset — its own fills too — and on a CropBox away from
@@ -2849,7 +2859,7 @@ def _paint_boxes(page) -> None:
             if shape is None:
                 shape = page.new_shape()
             shape.draw_rect(annot.rect)
-            if any(annot.rect.intersects(image) for image in images):
+            if blanks and any(annot.rect.intersects(image) for image in images):
                 shape.finish(fill=fill, color=fill)  # as apply_redactions strokes it
             else:
                 shape.finish(fill=fill, color=None, width=0)
@@ -3385,9 +3395,20 @@ def redact_pdf(
                 _check_image_budget(doc, pages=pages_with_redactions)
                 pymupdf.TOOLS.set_small_glyph_heights(True)
                 try:
+                    # An image may show the match: its pixels go under the whole
+                    # box, unpainted. Text goes under the box that spares the
+                    # glyphs beside the match, painted. Pixels first: _in_pixels
+                    # reads the match's hidden glyphs, which the text pass removes.
+                    for m in matches_to_apply:
+                        doc[m.page].add_redact_annot(
+                            pymupdf.Rect(*(m.pixel_bbox or m.bbox)), fill=False)
+                    _apply_redactions(
+                        doc, pages_with_redactions, deadline, text=pymupdf.PDF_REDACT_TEXT_NONE)
                     for m in matches_to_apply:
                         doc[m.page].add_redact_annot(pymupdf.Rect(*m.bbox), fill=(0, 0, 0))
-                    _apply_redactions(doc, pages_with_redactions, deadline)
+                    for number in pages_with_redactions:
+                        _check_deadline(deadline)
+                        _redact_page(doc[number], images=pymupdf.PDF_REDACT_IMAGE_NONE)
                 finally:
                     pymupdf.TOOLS.set_small_glyph_heights(False)
 

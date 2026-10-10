@@ -835,6 +835,8 @@ def test_a_pending_mark_on_a_shared_image_blanks_it_on_every_page():
         assert _dark_on_page(doc, 1)
     with pymupdf.open(stream=redact_pdf(source, strategy="email"), filetype="pdf") as doc:
         assert _dark_on_page(doc, 1) == 0
+        # It blanks the pixels it covers: its stroke covers the edge of the blank.
+        assert [d["type"] for d in doc[0].get_drawings()] == ["fs"]
 
 
 def test_a_shared_letterhead_saying_bi_does_not_refuse_a_page_image():
