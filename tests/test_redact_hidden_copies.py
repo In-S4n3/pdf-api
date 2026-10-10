@@ -133,11 +133,16 @@ def _table(pdf):
     return table, header
 
 
-def test_class_attributes_and_id_tree_limits_lose_the_match():
+@pytest.mark.parametrize("indirect", [False, True])
+def test_class_attributes_and_id_tree_limits_lose_the_match(indirect):
+    """An indirect /ClassMap: the id tree's sweep, named like the set of
+    containers already swept, took its place, and the redaction failed (500)."""
     pdf = _tagged({})
     table, header = _table(pdf)
     root = pdf.Root.StructTreeRoot
     root.ClassMap = Dictionary(T1=Dictionary(O=Name.Table, Summary=String(f"Owner {SECRET}")))
+    if indirect:
+        root.ClassMap = pdf.make_indirect(root.ClassMap)
     table.C = Name.T1
     header.ID = String(SECRET)
     leaf = pdf.make_indirect(Dictionary(
@@ -147,6 +152,77 @@ def test_class_attributes_and_id_tree_limits_lose_the_match():
     assert _copies_left(output, SECRET) == []
     with pikepdf.open(io.BytesIO(output)) as out:
         assert str(out.Root.StructTreeRoot.ClassMap.T1.Summary) == "Owner "
+
+
+def _id_tree_keys(node) -> list[bytes]:
+    """Every key, leaf by leaf; each node's /Limits checked against its keys."""
+    keys = [bytes(k) for k in list(node.get("/Names", []))[::2]]
+    for kid in node.get("/Kids", []):
+        keys += _id_tree_keys(kid)
+    if "/Limits" in node:
+        assert [bytes(k) for k in node.Limits] == [min(keys), max(keys)]
+    return keys
+
+
+@pytest.mark.parametrize(("options", "ids"), [
+    ({"strategy": "email"}, ["TH-1", "TH-2", f"TH-{SECRET}"]),
+    ({"strategy": "custom", "custom_text": SECRET}, ["TH-1", "TH-2", f"TH-{SECRET}"]),
+    # Two ids the redaction makes one: «H-» twice.
+    ({"strategy": "custom", "custom_text": SECRET}, ["TH-1", f"H-{SECRET}", f"H-{SECRET.upper()}"]),
+], ids=["emptied", "moved", "collided"])
+def test_the_id_tree_stays_sorted_and_finds_every_element(options, ids):
+    """A swept key moved out of order and out of its leaf's /Limits: a reader's
+    lookup by id (a binary search) then missed every element, «TH-1» too."""
+    pdf = _tagged({})
+    table, header = _table(pdf)
+    cell = table.K.K[1]
+    elems = [cell, table, header]
+    for elem, value in zip(elems, ids, strict=True):
+        elem.ID = String(value)
+    ordered = sorted(zip(ids, elems, strict=True))
+    leaves = [pdf.make_indirect(Dictionary(
+        Names=Array([x for k, e in part for x in (String(k), e)]),
+        Limits=Array([String(part[0][0]), String(part[-1][0])])))
+        for part in (ordered[:2], ordered[2:])]
+    pdf.Root.StructTreeRoot.IDTree = pdf.make_indirect(Dictionary(Kids=Array(leaves)))
+    _check_id_tree(redact_pdf(_bytes(pdf), **options))
+
+
+def _check_id_tree(output: bytes) -> None:
+    assert _copies_left(output, SECRET) == []
+    with pikepdf.open(io.BytesIO(output)) as out:
+        tree = out.Root.StructTreeRoot.IDTree
+        keys = _id_tree_keys(tree)
+        assert keys == sorted(set(keys)), "sorted, each id once"
+        named = [o for o in out.objects if isinstance(o, Dictionary) and "/S" in o and "/ID" in o]
+        assert len(named) == len(keys)
+        for elem in named:  # qpdf's own lookup, no repair
+            assert pikepdf.NameTree(tree, auto_repair=False)[str(elem.ID)].objgen == elem.objgen
+        assert b"TH-1" in keys
+
+
+def test_stale_id_tree_limits_lose_the_match():
+    """Limits left from a key another editor removed: no key holds the email."""
+    pdf = _tagged({})
+    _, header = _table(pdf)
+    header.ID = String("TH-1")
+    leaf = pdf.make_indirect(Dictionary(
+        Names=Array([String("TH-1"), header]),
+        Limits=Array([String("TH-1"), String(f"TH-{SECRET}")])))
+    pdf.Root.StructTreeRoot.IDTree = Dictionary(Kids=Array([leaf]))
+    _check_id_tree(redact_pdf(_bytes(pdf), strategy="custom", custom_text=SECRET))
+
+
+def test_an_element_only_the_id_tree_reaches_loses_the_match():
+    """Its key lost the match and its /Alt and /ID kept it."""
+    pdf = _tagged({})
+    orphan = pdf.make_indirect(
+        Dictionary(S=Name.Span, ID=String(f"TH-{SECRET}"), Alt=String(f"by {SECRET}")))
+    pdf.Root.StructTreeRoot.IDTree = Dictionary(Names=Array([String(f"TH-{SECRET}"), orphan]))
+    output = redact_pdf(_bytes(pdf), strategy="custom", custom_text=SECRET)
+    assert _copies_left(output, SECRET) == []
+    with pikepdf.open(io.BytesIO(output)) as out:
+        assert str(out.Root.StructTreeRoot.IDTree.Names[1].Alt) == "by "
 
 
 def test_a_pattern_too_slow_for_a_hidden_string_empties_it_after_payment():
@@ -1202,6 +1278,34 @@ def test_a_scan_drawn_again_on_its_page_in_a_layer_that_is_off_keeps_no_original
     with pymupdf.open(stream=redact_pdf(source, strategy="email"), filetype="pdf") as doc:
         assert [pymupdf.Pixmap(doc, item[0]).digest for item in doc[0].get_images(full=True)
                 if pymupdf.Pixmap(doc, item[0]).digest == original] == []
+
+
+def test_a_scan_drawn_again_turned_over_the_box_in_a_layer_that_is_off_keeps_no_copy():
+    """MuPDF made a copy for the hidden placement, blank where the box falls on
+    it turned: elsewhere than the email. No page shows that copy, so nothing
+    paired it, and switched on, the layer showed half the email upside down."""
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=400, height=200)
+        xref = page.insert_image(pymupdf.Rect(0, 0, 400, 100), stream=_picture(SECRET))
+        page.insert_image(pymupdf.Rect(0, 0, 400, 100), xref=xref, rotate=180)
+        layer = doc.add_ocg("Hidden copy", on=False)
+        resources = int(doc.xref_get_key(page.xref, "Resources")[1].split()[0])
+        doc.xref_set_key(resources, "Properties", f"<< /H {layer} 0 R >>")
+        last = page.get_contents()[-1]
+        doc.update_stream(last, b"/OC /H BDC\n" + doc.xref_stream(last) + b"\nEMC")
+        page.insert_text((10, 60), SECRET, fontsize=30, render_mode=3)  # its OCR layer
+        source = doc.tobytes()
+    with pymupdf.open(stream=source, filetype="pdf") as doc:
+        boxes = [pymupdf.Rect(m.bbox) + (-2, -2, 2, 2) for m in _extract_matches(
+            doc, strategy="email", custom_text="", regex_pattern="")]
+    with pymupdf.open(stream=redact_pdf(source, strategy="email"), filetype="pdf") as doc:
+        doc.xref_set_key(doc.pdf_catalog(), "OCProperties", "null")  # every layer on
+        with pymupdf.open(stream=doc.tobytes(), filetype="pdf") as shown:
+            pix = shown[0].get_pixmap()
+    dark = [(x, y) for x in range(pix.width) for y in range(pix.height)
+            if pix.pixel(x, y)[0] < 100]
+    assert dark, "the black box shows"
+    assert [p for p in dark if not any(pymupdf.Point(p) + (0.5, 0.5) in b for b in boxes)] == []
 
 
 def test_a_pending_mark_over_an_image_the_last_page_draws_twice_is_not_a_500():

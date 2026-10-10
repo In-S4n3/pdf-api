@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pymupdf
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -178,3 +179,42 @@ def test_fill_form_is_deprecated_without_removing_the_endpoint(sample_pdf):
     assert r.headers["deprecation"] == "@1787875200"
     assert "sunset" not in r.headers
     assert "rel=\"deprecation\"" in r.headers["link"]
+
+
+@pytest.mark.parametrize("scan", [False, True], ids=["text", "scan"])
+@pytest.mark.parametrize("crop", [None, (100, 50, 500, 750)], ids=["mediabox", "cropbox"])
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_preview_boxes_sit_where_the_turned_page_shows_the_match(rotation, crop, scan):
+    """The UI draws each box as a share of the page as shown, turned by /Rotate
+    (react-pdf's viewport); the boxes came unturned, over other words. And on a
+    CropBox away from 0 0, the black box itself went off the email."""
+    from app.router_v2 import _extract_matches_json
+    from app.services.pdf_tools import redact_pdf
+
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=600, height=800)
+        if scan:  # a blank scan under its OCR layer: PyMuPDF paints that box
+            pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 10), False)
+            pixmap.clear_with(255)
+            page.insert_image(pymupdf.Rect(120, 270, 480, 320), pixmap=pixmap)
+        page.insert_text((150, 300), "Mail ana@example.com end", fontsize=14,
+                         render_mode=3 if scan else 0)
+        if crop:
+            page.set_cropbox(pymupdf.Rect(crop))
+        page.set_rotation(rotation)
+        source = doc.tobytes()
+    [match] = _extract_matches_json(
+        source, strategy="email", custom_text="", regex_pattern="", match_cap=10)["matches"]
+    output = redact_pdf(source, strategy="email", confirmed_ids=[match["id"]])
+    with pymupdf.open(stream=output, filetype="pdf") as doc:
+        pix = doc[0].get_pixmap()  # the page as shown, 1 pixel per point
+        assert (pix.width, pix.height) == (round(doc[0].rect.width), round(doc[0].rect.height))
+        x0, y0, x1, y1 = (round(v) for v in match["bbox"])
+        inside = [pix.pixel(x, y)[0] for x in range(x0 + 1, x1 - 1) for y in range(y0 + 1, y1 - 1)]
+        assert inside and max(inside) < 100, "the black box is where the preview drew it"
+    # Painted over is not removed: the email is gone from the text too.
+    from tests.test_redact_hidden_copies import _drawn_text
+    from tests.test_redact_neighbours import _no_match_survives
+
+    _no_match_survives(output, "ana@example.com")
+    assert "Mail" in _drawn_text(output) and "end" in _drawn_text(output)
