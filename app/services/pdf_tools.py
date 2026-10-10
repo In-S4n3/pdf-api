@@ -1777,6 +1777,20 @@ def _busiest_ocr_worker(megapixels: list[float]) -> float:
     return max(workers)
 
 
+def _ocr_split_size(pages: list[int], costs: list[float], budget: float) -> int:
+    """Largest N whose every part, as Dividir PDF cuts «A cada N páginas» (pages
+    1..N, N+1..2N, …), passes the OCR gate. Measuring only the first pages advised
+    16 for 16 grey scans then 12 A3 photos; the second part, the photos, was
+    refused again. Capped at MAX_OCR_PAGES, so no part holds more OCR pages."""
+    for size in range(MAX_OCR_PAGES, 1, -1):
+        parts: dict[int, list[float]] = {}
+        for pno, cost in zip(pages, costs, strict=True):
+            parts.setdefault((pno - 1) // size, []).append(cost)
+        if all(_busiest_ocr_worker(part) <= budget for part in parts.values()):
+            return size
+    return 1  # every page alone fits: the caller refused page_too_large before
+
+
 def ocr_pdf(content: bytes, language: str) -> bytes:
     """Run OCRmyPDF with the requested language on the pages that need it."""
     lang_code = LANGUAGE_MAP.get(language)
@@ -1824,14 +1838,6 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 "Este PDF tem campos de formulário. Use «Achatar PDF» primeiro e "
                 "depois volte a fazer OCR ao ficheiro achatado.",
             )
-        if len(pages) > MAX_OCR_PAGES:
-            raise ApiError(
-                422,
-                "too_many_pages",
-                f"Este PDF tem {len(pages)} páginas para reconhecer e o OCR processa até "
-                f"{MAX_OCR_PAGES} páginas de cada vez. Na ferramenta Dividir PDF, escolha "
-                f"«A cada N páginas», escreva {MAX_OCR_PAGES} e processe cada parte.",
-            )
         # --redo-ocr strips invisible text from the page's own content only, and
         # OCRmyPDF keeps its layer in a Form XObject (/OCR- + Name.random's 22
         # characters): OCR of our own output kept the old layer and added a second
@@ -1855,22 +1861,36 @@ def ocr_pdf(content: bytes, language: str) -> bytes:
                 "Este PDF tem páginas demasiado grandes ou com resolução demasiado alta "
                 "para OCR.",
             )
+        # Before any advice to split: a part keeps its images, so a PDF refused
+        # for one was sent to Dividir PDF for nothing (Codex, round 1).
+        _check_image_budget(doc, pages=[pno - 1 for pno in pages])
         costs = [max(mpx, OCR_PAGE_FLOOR_MEGAPIXELS) for mpx in megapixels]
-        if _busiest_ocr_worker(costs) > worker_budget:
-            fit = sum(
-                1
-                for n in range(1, len(pages) + 1)
-                if _busiest_ocr_worker(costs[:n]) <= worker_budget
+        all_pages = len(pages) == doc.page_count
+        # The page cap is checked here, priced: 29 colour scans were told 28,
+        # and a part of 28 colour scans is refused (24 fit).
+        if len(pages) > MAX_OCR_PAGES or _busiest_ocr_worker(costs) > worker_budget:
+            fit = _ocr_split_size(pages, costs, worker_budget)
+            heavy = not (len(pages) > MAX_OCR_PAGES and fit == MAX_OCR_PAGES)
+            # N counts every page Dividir PDF cuts, text ones too: with some pages
+            # already searchable it is no capacity («5 páginas para reconhecer
+            # … processa até 9», Codex round 1).
+            why = (
+                ", a cores ou em alta resolução: demasiadas para o OCR de uma só vez"
+                if heavy and not all_pages
+                else f"{', a cores ou em alta resolução,' if heavy else ''} e o OCR "
+                f"processa até {fit} páginas de cada vez"
             )
             raise ApiError(
                 422,
                 "too_many_pages",
-                f"Este PDF tem {len(pages)} páginas para reconhecer, a cores ou em alta "
-                f"resolução, e o OCR processa até {fit} páginas de cada vez. Na ferramenta Dividir "
-                f"PDF, escolha «A cada N páginas», escreva {fit} e processe cada parte.",
+                f"Este PDF tem {len(pages)} páginas para reconhecer{why}. Na ferramenta "
+                f"Dividir PDF, escolha «A cada N páginas», escreva {fit} e processe "
+                # A part may hold only searchable pages: it would answer
+                # already_searchable (35 text pages, then 5 photos → 19; Codex).
+                # The first sentence's own term: a scan with a selectable footer
+                # still has text, yet is a page to recognise (Codex, round 3).
+                f"{'cada parte' if all_pages else 'as partes com páginas para reconhecer'}.",
             )
-        _check_image_budget(doc, pages=[pno - 1 for pno in pages])
-        all_pages = len(pages) == doc.page_count
         mode = "--skip-text" if form_pdf else "--redo-ocr"
         if stripped:
             content = doc.tobytes()

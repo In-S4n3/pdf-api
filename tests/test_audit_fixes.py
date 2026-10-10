@@ -638,6 +638,107 @@ def test_ocr_prices_small_pages_at_their_share_of_the_page_cap(client, monkeypat
     assert _error(response)["code"] == "too_many_pages"
 
 
+def _grey_scans_then_a3_photos():
+    """16 grey A4 scans (15 Mpx each, the floor), then 12 colour A3 photos with
+    captions (61.9 Mpx: two never share a worker's 105)."""
+    doc = pymupdf.open()
+    for _ in range(16):
+        _grey_a4_scan_page(doc)
+    doc.insert_pdf(_photo_pages(12))
+    for pno in range(16, 28):
+        doc[pno].set_mediabox(pymupdf.Rect(0, 0, 842, 1191))  # A3
+    return doc
+
+
+def _colour_scans(count: int):
+    doc = pymupdf.open()
+    for _ in range(count):
+        _colour_scan_page(doc)
+    return doc
+
+
+def _text_pages_then_a3_photos():
+    """5 pages of real text, then 5 colour A3 photos: OCR pages 6-10 only."""
+    line = "Uma linha de texto verdadeiro, com mais de trinta letras."
+    doc = pymupdf.open(stream=_text_pdf([line], pages=5), filetype="pdf")
+    doc.insert_pdf(_photo_pages(5))
+    for pno in range(5, 10):
+        doc[pno].set_mediabox(pymupdf.Rect(0, 0, 842, 1191))  # A3
+    return doc
+
+
+def test_ocr_split_counts_every_page_and_claims_no_capacity(client, monkeypatch):
+    """Codex, round 1: Dividir PDF counts the text pages too. Parts of 9 pages
+    hold at most 4 photos, one per worker; 10 would hold all 5. The old wording
+    said «5 páginas para reconhecer … processa até 9 páginas de cada vez»."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    pdf = _text_pages_then_a3_photos().tobytes()
+    message = _error(_post(client, "ocr", pdf, {"language": "portuguese"}))["message"]
+    assert "escreva 9 " in message
+    assert "processa até" not in message
+
+
+def test_ocr_split_advice_names_only_the_parts_that_need_ocr(client, monkeypatch):
+    """Codex, round 2: 35 text pages, then 5 A3 photos, advise 19. Part 1 holds
+    only text and answers already_searchable, so «processe cada parte» was false."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    line = "Uma linha de texto verdadeiro, com mais de trinta letras."
+    doc = pymupdf.open(stream=_text_pdf([line], pages=35), filetype="pdf")
+    doc.insert_pdf(_photo_pages(5))
+    for pno in range(35, 40):
+        doc[pno].set_mediabox(pymupdf.Rect(0, 0, 842, 1191))  # A3
+    message = _error(_post(client, "ocr", doc.tobytes(), {"language": "portuguese"}))["message"]
+    assert "escreva 19 e processe as partes com páginas para reconhecer." in message
+
+
+def test_ocr_refuses_an_oversized_image_before_advising_a_split(client, monkeypatch):
+    """Codex, round 1: splitting keeps every image, so a PDF the image gate
+    refuses was first sent to Dividir PDF, and then each part was refused."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    monkeypatch.setattr(pdf_tools, "MAX_IMAGE_PIXELS", 1)
+    response = _post(client, "ocr", _photo_pages(13).tobytes(), {"language": "portuguese"})
+    assert _error(response)["code"] == "image_too_large"
+
+
+def test_ocr_split_advice_fits_every_part_not_only_the_first(client, monkeypatch):
+    """Codex, 2026-10-10 (retro review of #9): the advice measured only the first
+    pages. It said 16; the first part fit (60 Mpx busiest), the second, 12 A3
+    photos, ran 185.7 Mpx against 105 and was refused again. Every part of 4 fits:
+    one A3 photo per worker."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    pdf = _grey_scans_then_a3_photos().tobytes()
+    response = _post(client, "ocr", pdf, {"language": "portuguese"})
+    assert response.status_code == 422
+    assert _error(response)["code"] == "too_many_pages"
+    assert "escreva 4 e processe cada parte." in _error(response)["message"]
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        _grey_scans_then_a3_photos,
+        lambda: _photo_pages(13),
+        lambda: _colour_scans(29),  # over the page cap, which advised 28 unpriced
+        _text_pages_then_a3_photos,
+    ],
+    ids=["grey-then-a3", "photos", "colour-over-page-cap", "text-then-a3"],
+)
+def test_every_part_of_the_advised_split_passes_the_ocr_gate(client, monkeypatch, build):
+    """Following the advice is never refused again: each part Dividir PDF cuts
+    «A cada N páginas» (pages 1..N, N+1..2N, …) reaches ocrmypdf."""
+    monkeypatch.setattr(pdf_tools, "_run_command", _no_tool)
+    doc = build()
+    message = _error(_post(client, "ocr", doc.tobytes(), {"language": "portuguese"}))["message"]
+    size = int(re.search(r"escreva (\d+) ", message)[1])
+    calls = _ocr_calls(monkeypatch)
+    starts = range(0, doc.page_count, size)
+    for start in starts:
+        part = pymupdf.open()
+        part.insert_pdf(doc, from_page=start, to_page=min(start + size, doc.page_count) - 1)
+        _post(client, "ocr", part.tobytes(), {"language": "portuguese"})
+    assert len(calls) == len(starts) > 1
+
+
 def test_tesseract_cannot_skip_a_page_before_the_job_is_killed(client, monkeypatch):
     """ocrmypdf ships a page whose Tesseract timed out without text and still
     succeeds; with the page timeout at the subprocess kill, the kill comes first."""
