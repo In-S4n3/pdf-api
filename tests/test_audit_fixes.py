@@ -549,7 +549,8 @@ def test_ocr_budgets_the_pixels_not_only_the_pages(client, monkeypatch):
     assert response.status_code == 422
     assert _error(response)["code"] == "too_many_pages"
     assert "até 12 páginas" in _error(response)["message"]
-    assert "Dividir PDF" in _error(response)["message"] and "escreva 12" in _error(response)["message"]
+    assert "Dividir PDF" in _error(response)["message"]
+    assert "escreva 12" in _error(response)["message"]
 
 
 def test_ocr_takes_24_colour_scans_and_refuses_25(client, monkeypatch):
