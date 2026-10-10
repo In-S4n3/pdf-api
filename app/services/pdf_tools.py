@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import heapq
 import io
+import itertools
 import json
 import logging
 import math
@@ -21,7 +23,7 @@ import threading
 import time
 import urllib.parse
 import zlib
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterator
 from contextlib import suppress
 from contextvars import ContextVar
@@ -415,13 +417,15 @@ def _iter_matches(
             in_pixels = _in_pixels(trace)
             images = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()] if searches else []
             covered = []  # boxes that may cover the match in an image's pixels too
-            matched: dict = {}  # per view, read once the page has a hit
+            matched: dict = {}  # per view, read once the page has a match
             for view, needle in searches:
                 _check_deadline(deadline, _SCAN_TIMEOUT_MESSAGE)
-                for rect in page.search_for(needle, flags=_SEARCH_FLAGS | view):
-                    if view not in matched:
-                        matched[view] = _where_it_matches(page, compiled_pattern, view, images)
-                    words = matched[view](rect, needle)
+                if view not in matched:
+                    matched[view] = _where_it_matches(page, compiled_pattern, view, images)
+                where, across = matched[view]
+                hits = page.search_for(needle, flags=_SEARCH_FLAGS | view)
+                for rect in hits + across.get(needle.translate(_ASCII_LOWER), []):
+                    words = where(rect, needle)
                     if words == []:
                         continue
                     if in_pixels(rect):
@@ -457,7 +461,9 @@ def _iter_matches(
 
 def _where_it_matches(page, compiled_pattern, view: int, images: list):
     """Where a search_for hit is the match: the box of each of its words, []
-    if the hit is not the match, None if no glyph lies under it.
+    if the hit is not the match, None if no glyph lies under it. And, per
+    match, the hits search_for cannot find: a line each for a match across a
+    hyphenated line break (_across_breaks).
 
     search_for finds the needle inside more text too: the phone 912345678 cost
     the account 19123456780 its digits. The page is read glyph by glyph, the
@@ -503,22 +509,66 @@ def _where_it_matches(page, compiled_pattern, view: int, images: list):
         tested.setdefault(key(char), deque()).append(pymupdf.Rect(char["bbox"]))
     count = Counter(key(char) for char in chars_of(placed))
     tested = {k: boxes for k, boxes in tested.items() if len(boxes) == count[k]}
-    lines, text, glyphs = [], [], []
-    for line in lines_of(placed):
-        start, line_box = len(text), pymupdf.Rect(line["bbox"])
-        for char in (c for span in line["spans"] for c in span["chars"]):
-            box = tested[key(char)].popleft() if key(char) in tested else None
-            text.append(char["c"])
-            glyphs.append((pymupdf.Rect(char["bbox"]), box))
-            line_box |= box or line_box
-        lines.append((line_box, start, len(text), not line["wmode"]))
-        text.append("\n")
-        glyphs.append(None)
+    lines, text, glyphs, frames = [], [], [], []
+    joinable = set()  # the line breaks where the next line carries the one above on
+    above = None
+    for block in placed["blocks"]:
+        # Upright, a new block is a new paragraph: a cell below, double spacing.
+        # Turned, it says nothing: MuPDF puts each turned line in its own.
+        if above and above[0] == (1, 0):
+            above = None
+        for line in block.get("lines", ()):
+            start, line_box = len(text), pymupdf.Rect(line["bbox"])
+            # The line as if unturned: a turned paragraph's next line is not
+            # below, nor are the lines beside a turned word. Turned by a right
+            # angle, upright boxes stay exact; otherwise the line's quad.
+            (cos, sin), flat = line["dir"], not line["wmode"]
+            frames.append(pymupdf.Matrix(cos, -sin, sin, cos, 0, 0))
+            square = abs(cos * sin) < 1e-6
+            here = None
+            if flat and line["spans"]:
+                own = line_box.quad if square else pymupdf.recover_line_quad(line)
+                here = (tuple(line["dir"]), (own * frames[-1]).rect)
+            if above and here and above[0] == here[0] and _continues(above[1], here[1]):
+                joinable.add(start - 1)
+            above = here
+            turn = frames[-1] if square else pymupdf.Identity
+            for char in (c for span in line["spans"] for c in span["chars"]):
+                box = tested[key(char)].popleft() if key(char) in tested else None
+                text.append(char["c"])
+                glyphs.append((pymupdf.Rect(char["bbox"]), box, turn))
+                line_box |= box or line_box
+            lines.append((line_box, start, len(text), flat))
+            text.append("\n")
+            glyphs.append(None)
     text = "".join(text)
-    found, in_match = [], [None] * len(text)
+    found: list[str] = []
+    in_match: defaultdict[int, list[int]] = defaultdict(list)  # the matches each character is in
+
+    def note(start: int, end: int, matched: str) -> None:
+        found.append(" ".join(matched.split()).translate(_ASCII_LOWER))
+        for i in range(start, end):
+            in_match[i].append(len(found) - 1)
+
     for m in _finditer(compiled_pattern, text):
-        found.append(" ".join(m.group().split()).translate(_ASCII_LOWER))
-        in_match[m.start():m.end()] = [len(found) - 1] * (m.end() - m.start())
+        note(m.start(), m.end(), m.group())
+    # A match across a hyphenated line break: search_for never finds it, so its
+    # hits, one per line, come from here. Its hyphen goes with it. Each hit is
+    # the middle of each glyph's box, so no glyph of a tightly led line above
+    # or below lies in it — in the line's own frame, turned back after. One
+    # band through the line's middle passed over 12 pt glyphs between 120 pt.
+    across: defaultdict[str, list] = defaultdict(list)
+    for start, end, matched in _across_breaks(compiled_pattern, text, joinable):
+        note(start, end, matched)
+        for (_, first, last, _), frame in zip(lines, frames, strict=True):
+            band = None
+            for i in range(max(first, start), min(last, end)):
+                box = glyphs[i][0] * frame
+                middle, quarter = (box.y0 + box.y1) / 2, box.height / 4
+                own = pymupdf.Rect(box.x0, middle - quarter, box.x1, middle + quarter)
+                band = own if band is None else band | own
+            if band is not None:
+                across[found[-1]].append(band * ~frame)
     upright = {i for _, start, end, flat in lines if flat for i in range(start, end)}
 
     def known(held: set) -> bool:  # MuPDF's boxes of upright glyphs
@@ -530,7 +580,7 @@ def _where_it_matches(page, compiled_pattern, view: int, images: list):
         if not hit:
             return None
         needle = " ".join(needle.split()).translate(_ASCII_LOWER)
-        mine = [i for i in hit if in_match[i] is not None and needle in found[in_match[i]]]
+        mine = [i for i in hit if any(needle in found[k] for k in in_match.get(i, ()))]
         held = set(mine)
         runs: list[list[int]] = []
         for i in mine:
@@ -549,14 +599,18 @@ def _where_it_matches(page, compiled_pattern, view: int, images: list):
                 box |= glyphs[i][0]
                 box |= glyphs[i][1] or box
             if known(held) and not any(box.intersects(image) for image in images):
-                others = [glyphs[j][1] for line_box, start, end, _ in lines
-                          if line_box.intersects(box) for j in range(start, end)
-                          if j not in held and glyphs[j][1] is not None and not text[j].isspace()]
-                box = _spare_neighbours(box, [glyphs[i][1] for i in run], others)
+                near = [j for line_box, start, end, _ in lines
+                        if line_box.intersects(box) for j in range(start, end)
+                        if j not in held and glyphs[j][1] is not None and not text[j].isspace()]
+                turn = glyphs[run[0]][2]  # judged as if its line were upright
+                mine = [glyphs[i][1] * turn for i in run]
+                others = [glyphs[j][1] * turn for j in near]
+                box = _spare_neighbours(box * turn, mine, others)
+                box = _clear_of_neighbours(box, mine, others) * ~turn
             boxes.append((box.x0, box.y0, box.x1, box.y1, "".join(text[i] for i in run)))
         return boxes
 
-    return words
+    return words, across
 
 
 def _centre(rect) -> pymupdf.Point:
@@ -607,6 +661,81 @@ def _spare_neighbours(box, mine: list, others: list) -> pymupdf.Rect:
     return pymupdf.Rect(edges)
 
 
+def _inset(glyph, share: float) -> pymupdf.Rect:
+    """glyph's box, share of its width and height in from each side."""
+    w, h = share * glyph.width, share * glyph.height
+    return pymupdf.Rect(glyph.x0 + w, glyph.y0 + h, glyph.x1 - w, glyph.y1 - h)
+
+
+def _over(glyph, other) -> bool:
+    """Whether glyph is drawn over other, not beside it: on its line — centres
+    within an eighth of the taller one's height, or glyph's box as tall as
+    other's and more — and either centre within the other's width. A quarter
+    took 12 pt lines on 4 pt leading for one line, and cost them letters."""
+    a, b = _centre(glyph), _centre(other)
+    level = abs(a.y - b.y) <= max(glyph.height, other.height) / 8 or (
+        glyph.y0 <= other.y0 and other.y1 <= glyph.y1)
+    return level and abs(a.x - b.x) <= max(glyph.width, other.width) / 2
+
+
+def _clear_of_neighbours(box, mine: list, others: list) -> pymupdf.Rect:
+    """box, cut off every glyph beside the match it would still remove — into
+    the match's middle if it must — or a refusal.
+
+    _spare_neighbours never cuts into the middle of a glyph of the match. Under
+    12 pt type on 7 pt leading the lines above and below meet inside that
+    middle, and the box took «Contact C», «today» and «gyp» with the match.
+    MuPDF removes a glyph whose box, 10% in from each side, the redaction
+    touches: a band through the match's middle removes it and spares lines a
+    few points away. Another line is cut off above or below, a glyph on the
+    match's own line beside it, each 2% past its tested part as
+    _spare_neighbours does — on the edge itself MuPDF still took «oday». Where
+    that cut leaves a glyph of the match out, the other side is tried: an «i»
+    above «Word» and one below, over its «W», are cut off at its side.
+
+    What lies under the black box goes with the match, as in any redaction
+    (decision D6, 2026-10-10): a glyph drawn over it (_over) — a watermark, a
+    stamp, a full stop kerned onto its last letter — is cut off only where the
+    box still reaches every glyph of the match, after every glyph beside it.
+    Refused where no box reaches them all and none beside them.
+
+    ponytail: one cut per glyph, first that works, in reading order; a box a
+    search over every order would find can still be refused.
+    """
+    span = pymupdf.Rect(mine[0])
+    for glyph in mine:
+        span |= glyph
+    middle = _centre(span)
+
+    def reaches(edges) -> bool:
+        return all(_inset(g, 0.12).intersects(pymupdf.Rect(edges)) for g in mine)
+
+    edges = list(box)  # x0, y0, x1, y1
+    drawn_over = [any(_over(g, m) for m in mine) for g in others]
+    beside = [g for g, over in zip(others, drawn_over, strict=True) if not over]
+    for over, glyph in sorted(zip(drawn_over, others, strict=True), key=lambda pair: pair[0]):
+        if not _inset(glyph, 0.08).intersects(pymupdf.Rect(edges)):
+            continue
+        centre, past = _centre(glyph), _inset(glyph, 0.08)
+        lines = (1, past.y1) if centre.y < middle.y else (3, past.y0)
+        sides = (0, past.x1) if centre.x < middle.x else (2, past.x0)
+        cuts = []
+        for side, edge in (lines, sides) if abs(centre.y - middle.y) > span.height / 4 else (
+                sides, lines):  # another line first, else the match's own
+            cuts.append(list(edges))
+            cuts[-1][side] = max(edges[side], edge) if side < 2 else min(edges[side], edge)
+        edges = next((cut for cut in cuts if reaches(cut)), edges if over else cuts[0])
+    box = pymupdf.Rect(edges)
+    if reaches(edges) and not any(_inset(g, 0.08).intersects(box) for g in beside):
+        return box
+    raise ApiError(
+        422,
+        "text_too_close",
+        "Este PDF tem texto tão junto ao que quer censurar que não o conseguimos "
+        "tirar sem apagar letras ao lado. " + _REDACT_AS_IMAGES,
+    )
+
+
 # The text a page draws, without /ActualText in place of its glyphs.
 _DRAWN = pymupdf.TEXT_IGNORE_ACTUALTEXT
 # All of it, also where no viewer shows it (off the page, outside the CropBox).
@@ -640,11 +769,93 @@ def _finditer(compiled_pattern, text: str) -> list:
 def _needles(compiled_pattern, text: str) -> list[str]:
     """First spelling of each match, in reading order. Variants in ASCII case
     collapse: search_for ignores it and would box the same place twice. It
-    does not ignore «Ã»: collapsed into «João», «JOÃO» was never searched."""
+    does not ignore «Ã»: collapsed into «João», «JOÃO» was never searched.
+    Then the matches only a word joined across a line break holds."""
     needles: dict[str, str] = {}
-    for needle in _occurrences(compiled_pattern, text):
+    joined = [" ".join(t.split()) for _, _, t in _across_breaks(compiled_pattern, text)]
+    for needle in _occurrences(compiled_pattern, text) + joined:
         needles.setdefault(needle.translate(_ASCII_LOWER), needle)
     return list(needles.values())
+
+
+# A letter, a hyphen ending the line, a letter starting the next one.
+_LINE_BREAK_HYPHEN = regex.compile(
+    r"(?<=[^\W\d_])([-\u00ad\u2010])([ \t]*\n[ \t]*)(?=[^\W\d_])")
+
+
+def _across_breaks(
+    compiled_pattern, text: str, joinable: set[int] | None = None
+) -> list[tuple[int, int, str]]:
+    """Each match across a word hyphenated at a line break: where it starts
+    and ends in text, and its text with the line joined. MuPDF's search joins
+    no line: «confidencial» was never found, both halves left readable.
+
+    Each hyphen goes («confiden-» «cial») or stays («Jean-» «Pierre») on its
+    own: one phrase can hold both, and every hyphen kept, or every one
+    dropped, missed «Jean-Pierre confidencial». Letters only: «345-» «678» is
+    not one figure. joinable: the line breaks where the next line carries the
+    one above on (_continues); without it, every one.
+
+    ponytail: each hyphen on its own over up to _BREAKS_IN_A_ROW line ends in
+    a row (14 readings per break); a match over more mixes them in no reading.
+    """
+    breaks = [m for m in _LINE_BREAK_HYPHEN.finditer(text)
+              if joinable is None or m.start(2) + m.group(2).index("\n") in joinable]
+    found: dict[tuple[int, int], str] = {}
+    for first in range(len(breaks)):
+        window: list = []
+        for m in breaks[first : first + _BREAKS_IN_A_ROW]:
+            if window and "\n" in text[window[-1].end() : m.start()]:
+                break  # not on the next line: no longer one run of lines
+            window.append(m)
+            for keep in itertools.product((False, True), repeat=len(window)):
+                joined, back = _cut(text, [  # the line break, and the hyphen unless kept
+                    m.span(2) if kept else (m.start(1), m.end(2))
+                    for m, kept in zip(window, keep, strict=True)
+                ])
+                for match in _finditer(compiled_pattern, joined):
+                    if match.end() == match.start():  # «Silva|$» matches nothing at the end too
+                        continue
+                    start, end = back(match.start()), back(match.end() - 1) + 1
+                    if end - start != match.end() - match.start():  # it crosses a break
+                        found.setdefault((start, end), match.group())
+    return [(start, end, matched) for (start, end), matched in found.items()]
+
+
+def _cut(text: str, spans: list[tuple[int, int]]):
+    """text without these spans, in order, and where each character of what
+    is left stands in text."""
+    pieces, starts, origins, at, length = [], [], [], 0, 0
+    for begin, end in [*spans, (len(text), len(text))]:
+        pieces.append(text[at:begin])
+        starts.append(length)
+        origins.append(at)
+        length, at = length + begin - at, end
+
+    def back(index: int) -> int:
+        k = bisect.bisect_right(starts, index) - 1
+        return origins[k] + index - starts[k]
+
+    return "".join(pieces), back
+
+
+_BREAKS_IN_A_ROW = 3
+
+
+def _continues(above, below) -> bool:
+    """Whether line below, read next, carries line above on, as in a
+    paragraph: the next line down, within 1.5 lines of it, starting where it
+    started or to its left, in the same column. Both boxes in the lines' own
+    frame, as if unturned. «Jean-» in one table cell and «Pierre» in the next,
+    or in a block far below, were joined, and both blacked out. Upright lines
+    join within one MuPDF block only (_where_it_matches): MuPDF starts a new
+    one 20 pt down under 12 pt type — the cell below, or double spacing, never
+    joined. Turned lines join across blocks: MuPDF gives each its own."""
+    return (
+        above.y0 < below.y0 <= above.y1 + 1.5 * above.height
+        and below.x0 <= above.x0 + 1
+        and below.x1 > above.x0
+    )
 
 
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
@@ -2490,19 +2701,20 @@ def _store_redacted_jpegs_as_jpeg(page, jpeg_boxes: set[tuple[float, ...]]) -> N
         doc.xref_set_key(xref, "Filter", "/DCTDecode")
 
 
-def _image_placements(page, among: set[int]) -> dict[int, tuple]:
+def _image_placements(page, among: set[int], *, turned: bool = False) -> dict[int, tuple]:
     """Every box where the page draws each of these image objects, and its size.
     get_images lists an image once per resource name, and one name can be drawn
     twice. No box: listed, never drawn — pages sharing one resource dictionary
-    each list every page's images."""
+    each list every page's images. turned: each box with how it is drawn
+    there, so one box drawn twice, turned, is two places."""
     placements: dict[int, tuple] = {}
     for item in page.get_images(full=True):
         if item[0] in among:
             boxes = placements.setdefault(item[0], (set(), item[2], item[3]))[0]
             with suppress(Exception):  # drawn through a form XObject
-                for rect in page.get_image_rects(item):
+                for rect, matrix in page.get_image_rects(item, transform=True):
                     if rect.x0 < rect.x1 and rect.y0 < rect.y1:  # not (1, 1, -1, -1)
-                        boxes.add(tuple(round(v, 1) for v in rect))
+                        boxes.add(tuple(round(v, 1) for v in (*rect, *(matrix if turned else ()))))
     return placements
 
 
@@ -2534,7 +2746,8 @@ def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False
     pages_per_image = Counter(
         xref for page in doc for xref in {i[0] for i in page.get_images(full=True)}
     )
-    pages_per_image.update(_drawn_in_a_layer_off(doc, page_numbers))
+    off = _drawn_in_a_layer_off(doc, page_numbers)
+    pages_per_image.update(off)
     for page_idx in page_numbers:
         _check_deadline(deadline)
         page = doc[page_idx]
@@ -2580,6 +2793,13 @@ def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False
                 blanked.setdefault(original, []).append(copy)
         for original in shared & (gone | {x for x, _ in pairs}) - once:
             page.replace_image(original, pixmap=_NO_IMAGE)
+        # A copy for a place no page shows: a layer that is off drew the scan
+        # again, turned, under the box, and MuPDF blanked that copy where the
+        # box falls on it turned — not over the email. Nothing pairs it.
+        sizes = {before[x][1:] for x in shared & off}
+        for copy, place in after.items():
+            if not place[0] and place[1:] in sizes and copy not in {c for _, c in pairs}:
+                page.replace_image(copy, pixmap=_NO_IMAGE)
     for original, copies in blanked.items():
         for copy in copies:
             _copy_object(doc, original, copy)
@@ -2594,7 +2814,7 @@ def _apply_redactions(doc, page_numbers, deadline: float, *, marks: bool = False
 
 def _redact_page(page) -> None:
     jpeg_boxes = _jpeg_image_boxes(page)
-    _fill_unstroked(page)
+    _paint_boxes(page)
     page.apply_redactions(
         images=pymupdf.PDF_REDACT_IMAGE_PIXELS,  # blank what the box covers
         graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
@@ -2603,35 +2823,49 @@ def _redact_page(page) -> None:
     _store_redacted_jpegs_as_jpeg(page, jpeg_boxes)
 
 
-def _fill_unstroked(page) -> None:
-    """Paint the boxes over no image here, without the stroke PyMuPDF adds.
+def _paint_boxes(page) -> None:
+    """Paint the redaction boxes here; apply_redactions paints none of them.
 
     apply_redactions fills each box and strokes it in the fill colour, 1 pt
     wide: half a point past every edge, a black rule under «5 de Outubro» on
-    the line above a redacted phone in a real footer. Over an image the stroke
-    stays: it covers the edge of what the box blanks. Painted before
-    apply_redactions, under any overlay text PyMuPDF writes after it.
+    the line above a redacted phone in a real footer. So a box over no image
+    is painted without it. Over an image the stroke stays: it covers the edge
+    of what the box blanks. Painted before apply_redactions, under any overlay
+    text PyMuPDF writes after it.
+
+    Painted unturned, as every box here is: on a turned page PyMuPDF's shape
+    drops the CropBox offset — its own fills too — and on a CropBox away from
+    0 0 the black box went off the email, half off the page.
     """
     images = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
-    shape = None
-    for annot in page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)):
-        fill = annot.colors["fill"]
-        if not fill or any(annot.rect.intersects(image) for image in images):
-            continue
-        if shape is None:
-            shape = page.new_shape()
-        shape.draw_rect(annot.rect)
-        shape.finish(fill=fill, color=None, width=0)
-        page.parent.xref_set_key(annot.xref, "IC", "null")
-    if shape is not None:
-        shape.commit()
+    rotation = page.rotation
+    page.set_rotation(0)
+    try:
+        shape = None
+        for annot in page.annots(types=(pymupdf.PDF_ANNOT_REDACT,)):
+            fill = annot.colors["fill"]
+            if not fill:
+                continue
+            if shape is None:
+                shape = page.new_shape()
+            shape.draw_rect(annot.rect)
+            if any(annot.rect.intersects(image) for image in images):
+                shape.finish(fill=fill, color=fill)  # as apply_redactions strokes it
+            else:
+                shape.finish(fill=fill, color=None, width=0)
+            page.parent.xref_set_key(annot.xref, "IC", "null")
+        if shape is not None:
+            shape.commit()
+    finally:
+        page.set_rotation(rotation)
 
 
 def _drawn_in_a_layer_off(doc, page_numbers) -> set[int]:
     """Images these pages draw again in a layer that is off. The page's own
     placements miss them, so the image was not taken for drawn twice, and that
     placement, off the box, kept the scan as it was: switched on, it showed the
-    email. Counted as shared, the image is blanked everywhere."""
+    email. Counted as shared, the image is blanked everywhere. Placements turned
+    too: one drawn again over the same box, upside down, is no new box."""
     seen = _with_every_layer_on(doc)
     if seen is doc:
         return set()
@@ -2640,8 +2874,8 @@ def _drawn_in_a_layer_off(doc, page_numbers) -> set[int]:
         for number in page_numbers:
             listed = {item[0] for item in doc[number].get_images(full=True)}
             if listed:
-                shown = _image_placements(doc[number], listed)
-                every = _image_placements(seen[number], listed)
+                shown = _image_placements(doc[number], listed, turned=True)
+                every = _image_placements(seen[number], listed, turned=True)
                 again |= {x for x in listed if len(every[x][0]) > len(shown[x][0])}
         return again
     finally:
@@ -2968,6 +3202,9 @@ def _without_hidden_copies(doc, compiled_pattern, deadline: float):
             for node in tree_nodes(tree.get("/ParentTree")):  # elements /K never reaches
                 if isinstance(nums := node.get("/Nums"), pikepdf.Array):
                     stack.extend(list(nums)[1::2])
+            for node in tree_nodes(tree.get("/IDTree")):  # and those only an id reaches
+                if isinstance(names := node.get("/Names"), pikepdf.Array):
+                    stack.extend(list(names)[1::2])
             while stack:
                 _check_deadline(deadline)
                 elem = stack.pop()
@@ -2989,13 +3226,36 @@ def _without_hidden_copies(doc, compiled_pattern, deadline: float):
                     if isinstance(attribute, pikepdf.Dictionary):
                         sweep_all(attribute)  # table /Headers name element ids
                 stack.append(elem.get("/K"))
+            def changed(holder, index) -> bool:
+                before = holder[index].unparse()
+                sweep(holder, index)
+                return holder[index].unparse() != before
+
+            entries, moved = [], False  # the id tree's keys and elements
             for node in tree_nodes(tree.get("/IDTree")):
                 if isinstance(ids := node.get("/Names"), pikepdf.Array):
-                    for index in range(0, len(ids), 2):
-                        sweep(ids, index)
+                    for index in range(0, len(ids) - 1, 2):
+                        moved |= changed(ids, index)
+                        entries.append((ids[index], ids[index + 1]))
                 if isinstance(limits := node.get("/Limits"), pikepdf.Array):
-                    for index in range(len(limits)):
-                        sweep(limits, index)
+                    moved |= any([changed(limits, index) for index in range(len(limits))])
+            if moved:
+                # A swept key left its place, or its leaf's /Limits: readers
+                # look ids up by binary search, and missed every element,
+                # untouched ids too. One leaf, sorted by bytes as the spec
+                # orders keys; a key swept into another's leaves the tree,
+                # and its element the /ID.
+                kept, taken = [], set()
+                strings = [(k, e) for k, e in entries if isinstance(k, pikepdf.String)]
+                for key, elem in sorted(strings, key=lambda entry: bytes(entry[0])):
+                    if bytes(key) not in taken:
+                        taken.add(bytes(key))
+                        kept += [key, elem]
+                    elif isinstance(elem, pikepdf.Dictionary) and isinstance(
+                        elem.get("/ID"), pikepdf.String
+                    ) and bytes(elem.ID) == bytes(key):
+                        del elem["/ID"]
+                tree.IDTree = pdf.make_indirect(pikepdf.Dictionary(Names=pikepdf.Array(kept)))
             if isinstance(classes := tree.get("/ClassMap"), pikepdf.Dictionary):
                 sweep_all(classes)  # attributes an element takes by its /C
 

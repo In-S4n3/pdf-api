@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
+import pymupdf
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 
 from app.auth import verify_api_key
@@ -298,14 +299,20 @@ def _extract_matches_json(
             check_hidden_copies(
                 doc, strategy=strategy, custom_text=custom_text, regex_pattern=regex_pattern
             )
+        # The boxes as the page is shown, turned by its /Rotate: the UI draws
+        # them over react-pdf's viewport, which turns it. The redaction works
+        # unturned, as MuPDF does; on a turned page the UI drew them elsewhere.
+        shown: dict[int, pymupdf.Matrix] = {}
         for match in matches:
             total += 1
             if len(matches_json) >= match_cap:
                 continue
+            if match.page not in shown:
+                shown[match.page] = doc[match.page].rotation_matrix
             matches_json.append({
                 "id": match.id,
                 "page": match.page,
-                "bbox": list(match.bbox),
+                "bbox": list(pymupdf.Rect(match.bbox) * shown[match.page]),
                 "kind": match.kind,
                 "context": match.context,
                 "fullMatch": match.full_match,
