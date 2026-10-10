@@ -11,16 +11,20 @@ import math
 import os
 import re as _re
 import signal
+import socket
+import ssl
 import string
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import zlib
 from collections import Counter, deque
 from collections.abc import Iterator
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -911,6 +915,117 @@ def _trim_process_output(value: str, limit: int = 500) -> str:
     return value[-limit:]
 
 
+#: «Cancelar» in TudoPDF aborts its fetch, but Cloud Run never passes a client
+#: disconnect to the container over HTTP/1.1 (docs.cloud.google.com/run/docs/
+#: troubleshooting), and an abandoned 25-page OCR held one of the two instances
+#: for ~90 s. So the caller names a URL in X-Cancel-Check (main.py sets both per
+#: request); while a tool runs, _spawn asks it and stops the tool once cancelled.
+CANCEL_CHECK_URL: ContextVar[str | None] = ContextVar("cancel_check_url", default=None)
+CALLER_GONE: ContextVar[threading.Event | None] = ContextVar("caller_gone", default=None)
+CANCEL_POLL_SECONDS = 2
+CANCEL_CHECK_TIMEOUT = 1.5
+CANCEL_CHECK_MAX_BYTES = 4096  # the whole answer: Vercel's headers alone are ~1.4 KB
+#: This project's Vercel previews — the deployment (tudopdf-gi7e00q8z-…) and its
+#: branch alias (tudopdf-git-<branch>-…) — never another team's *.vercel.app.
+_CANCEL_PREVIEW_HOST = _re.compile(r"tudopdf-[a-z0-9-]+-ins4n3s-projects\.vercel\.app")
+
+
+def _cancel_check_allowed(url: str) -> bool:
+    """Only our own hosts ever receive the API key. A malformed URL is refused,
+    never raised, and must be printable ASCII so no error can echo it."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # noqa: B018 — raises on a bad port
+    except ValueError:
+        return False
+    host = parts.hostname or ""
+    ours = host in ("tudopdf.app", "www.tudopdf.app") or _CANCEL_PREVIEW_HOST.fullmatch(host)
+    printable = _re.fullmatch(r"[\x21-\x7e]+", url) is not None
+    return bool(ours) and parts.scheme == "https" and printable
+
+
+_CANCEL_TLS = ssl.create_default_context()
+
+
+def _ask_cancelled(parts: urllib.parse.SplitResult, addresses: list, key: str) -> bool:
+    """One check under one wall-clock deadline: connect (split across the
+    addresses), TLS handshake, send and every recv each get only what is left,
+    so neither a trickling nor a silent server can stretch it. Only this thread
+    ever touches the socket. HTTP/1.0 with Connection: close rules out chunked
+    bodies and ends at EOF; a redirect is just a non-200, so the key never
+    follows it."""
+    deadline = time.monotonic() + CANCEL_CHECK_TIMEOUT
+
+    def left(share: int = 1) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("cancel check deadline")
+        return remaining / share
+
+    for i, (family, kind, proto, _, address) in enumerate(addresses):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(left(len(addresses) - i))
+            sock.connect(address)
+            break
+        except OSError:
+            sock.close()
+            if i == len(addresses) - 1:
+                raise
+    try:
+        if parts.scheme == "https":  # http only in tests: the allowlist demands https
+            sock = _CANCEL_TLS.wrap_socket(
+                sock, server_hostname=parts.hostname, do_handshake_on_connect=False
+            )
+            sock.settimeout(left())
+            sock.do_handshake()
+        host = parts.hostname + (f":{parts.port}" if parts.port else "")
+        path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+        request = f"GET {path} HTTP/1.0\r\nHost: {host}\r\nX-API-Key: {key}\r\n"
+        sock.settimeout(left())
+        sock.sendall(f"{request}Connection: close\r\n\r\n".encode())
+        data = b""
+        while len(data) <= CANCEL_CHECK_MAX_BYTES:
+            sock.settimeout(left())
+            if not (chunk := sock.recv(CANCEL_CHECK_MAX_BYTES + 1 - len(data))):
+                break
+            data += chunk
+    finally:
+        sock.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    if len(data) > CANCEL_CHECK_MAX_BYTES or not _re.match(rb"HTTP/1\.[01] 200\b", head):
+        raise ValueError("not a small 200")
+    return json.loads(body)["cancelled"] is True
+
+
+def _poll_cancel(url: str, gone: threading.Event, done: threading.Event) -> None:
+    """Set `gone` once the caller answers {"cancelled": true}. Anything else —
+    an error, a timeout, a non-200, odd JSON — means keep going, warned once.
+    Only the exception's type is logged: its text can echo the response."""
+    parts = urllib.parse.urlsplit(url)
+    key = get_settings().api_key or ""
+    try:
+        # Once per job, in this thread: the stdlib cannot cancel getaddrinfo, so
+        # a hung resolver holds this daemon thread until it returns, never the job.
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        addresses = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
+    except Exception as exc:
+        logger.warning("cancel check failed, job continues: %s", type(exc).__name__)
+        return
+    warned = False
+    while not done.wait(CANCEL_POLL_SECONDS):
+        try:
+            cancelled = _ask_cancelled(parts, addresses, key)
+        except Exception as exc:
+            if not warned:
+                logger.warning("cancel check failed, job continues: %s", type(exc).__name__)
+                warned = True
+            continue
+        if cancelled:
+            gone.set()
+            return
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """SIGKILL the tool's whole process group, then reap the leader.
 
@@ -934,10 +1049,17 @@ def _spawn(
 ) -> subprocess.CompletedProcess:
     """Run a tool in its own process group with TMPDIR inside the request's dir.
 
-    Raises subprocess.TimeoutExpired (after killing the whole group) and
-    FileNotFoundError; the caller's TemporaryDirectory then removes whatever the
+    Raises subprocess.TimeoutExpired or, once the caller cancels, ApiError 499
+    (both after killing the whole group), and FileNotFoundError; the caller's
+    TemporaryDirectory then removes whatever the
     tool wrote — ocrmypdf's work dir used to stay behind in RAM-backed /tmp.
     """
+    caller_gone = CALLER_GONE.get()
+    cancel_url = CANCEL_CHECK_URL.get()
+    if cancel_url and not _cancel_check_allowed(cancel_url):
+        logger.warning("X-Cancel-Check ignored: not an allowed https host")
+        cancel_url = None
+    done = threading.Event()
     proc = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -946,19 +1068,38 @@ def _spawn(
         env={**os.environ, "TMPDIR": tmpdir},
         **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}),
     )
-    if mem_bytes:
-        # Set from the parent right after spawn, not in preexec_fn (unsafe in a
-        # threaded server): the child is still starting, long before it decodes
-        # anything. ponytail: Linux-only; on macOS dev the timeout is the cap.
-        with suppress(AttributeError, OSError, ValueError):
-            import resource
-
-            resource.prlimit(proc.pid, resource.RLIMIT_AS, (mem_bytes, mem_bytes))
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        # Everything after Popen sits inside this guard: whatever raises, the group dies.
+        deadline = time.monotonic() + timeout
+        if mem_bytes:
+            # Set from the parent right after spawn, not in preexec_fn (unsafe in a
+            # threaded server): the child is still starting, long before it decodes
+            # anything. ponytail: Linux-only; on macOS dev the timeout is the cap.
+            with suppress(AttributeError, OSError, ValueError):
+                import resource
+
+                resource.prlimit(proc.pid, resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        if caller_gone is not None and cancel_url:
+            threading.Thread(
+                target=_poll_cancel, args=(cancel_url, caller_gone, done), daemon=True
+            ).start()
+        # Wake every 0.5 s to see whether the caller cancelled (retrying
+        # communicate() loses no output); the timeout still ends it at `deadline`.
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=min(0.5, deadline - time.monotonic()))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise
+                if caller_gone is not None and caller_gone.is_set():
+                    logger.warning("caller cancelled: killed %s", command[0])
+                    raise ApiError(499, "client_closed", "O pedido foi cancelado.") from None
     except BaseException:
         _kill_group(proc)
         raise
+    finally:
+        done.set()
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
