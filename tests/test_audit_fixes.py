@@ -496,8 +496,9 @@ def test_ocr_refuses_more_pages_than_fit_the_time_budget(client, monkeypatch):
     assert response.status_code == 422
     assert _error(response)["code"] == "too_many_pages"
     assert str(cap) in _error(response)["message"]
-    # Dividir PDF makes exactly two parts; Extrair PDF takes the range that fits.
-    assert "Extrair PDF" in _error(response)["message"]
+    # Dividir PDF splits «A cada N páginas» since TudoPDF #58: one run, every part fits.
+    assert "Dividir PDF" in _error(response)["message"]
+    assert f"escreva {cap}" in _error(response)["message"]
 
 
 def _ocr_calls(monkeypatch) -> list:
@@ -548,7 +549,7 @@ def test_ocr_budgets_the_pixels_not_only_the_pages(client, monkeypatch):
     assert response.status_code == 422
     assert _error(response)["code"] == "too_many_pages"
     assert "até 12 páginas" in _error(response)["message"]
-    assert "Extrair PDF" in _error(response)["message"]
+    assert "Dividir PDF" in _error(response)["message"] and "escreva 12" in _error(response)["message"]
 
 
 def test_ocr_takes_24_colour_scans_and_refuses_25(client, monkeypatch):
